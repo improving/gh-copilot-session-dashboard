@@ -119,15 +119,28 @@ def resolve_vscode_user_dir(override: str | None) -> Path:
     raise FileNotFoundError(f"VS Code user directory not found. Searched:\n{searched}")
 
 
-def _open_state_db(user_dir: Path) -> sqlite3.Connection | None:
-    """Open VS Code's own global state database (key/value cache), read-only."""
-    db_path = user_dir / "globalStorage" / "state.vscdb"
+def _open_ro_sqlite(db_path: Path) -> sqlite3.Connection | None:
     if not db_path.is_file():
         return None
     try:
         return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.Error:
         return None
+
+
+def _open_state_db(user_dir: Path) -> sqlite3.Connection | None:
+    """Open VS Code's own global state database (key/value cache), read-only."""
+    return _open_ro_sqlite(user_dir / "globalStorage" / "state.vscdb")
+
+
+def resolve_copilot_cli_dir() -> Path:
+    """Location of the standalone GitHub Copilot CLI's own local state.
+
+    This is a separate product from VS Code's Copilot Chat extension (which shims the CLI in
+    under globalStorage/github.copilot-chat/copilotCli/ to run it), but the CLI keeps its own
+    session history under the user's home directory regardless of which host launched it.
+    """
+    return Path.home() / ".copilot"
 
 
 def resolve_subscription_account(user_dir: Path) -> str | None:
@@ -342,6 +355,68 @@ def harvest_model_catalog(doc: dict, catalog: dict[str, dict[str, Any]]) -> None
         entry["maxInputTokens"] = int(max_input)
 
 
+def _iter_models_json_paths(user_dir: Path) -> list[Path]:
+    """Every locally cached copy of Copilot's live model/pricing catalog we can find.
+
+    The Copilot Chat extension fetches this from GitHub and writes it to disk purely for its own
+    debug logging, under a randomly-named subdirectory per session, in both global and per-
+    workspace storage. It is not a documented API and the path/schema can change.
+    """
+    paths: list[Path] = []
+    global_dir = user_dir / "globalStorage" / "github.copilot-chat" / "debug-logs"
+    if global_dir.is_dir():
+        paths.extend(global_dir.glob("*/models.json"))
+    workspace_storage = user_dir / "workspaceStorage"
+    if workspace_storage.is_dir():
+        paths.extend(workspace_storage.glob("*/[Gg]it[Hh]ub.copilot-chat/debug-logs/*/models.json"))
+    return paths
+
+
+def load_live_model_pricing(user_dir: Path) -> None:
+    """Best-effort refresh of MODEL_PRICING_BY_SLUG/DISPLAY from Copilot's own locally-cached,
+    live-fetched model catalog, in preference to the hardcoded table above (which only reflects
+    GitHub's published rates as of whenever this file was last edited).
+
+    Silently no-ops if no cache is found or it can't be parsed as expected; this file's
+    presence/location/schema is an internal debug artifact of the extension, not a stable format.
+    """
+    paths = _iter_models_json_paths(user_dir)
+    if not paths:
+        return
+    latest = max(paths, key=lambda p: p.stat().st_mtime)
+    try:
+        models = json.loads(latest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(models, list):
+        return
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_id = model.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            continue
+        billing = model.get("billing") if isinstance(model.get("billing"), dict) else {}
+        token_prices = billing.get("token_prices") if isinstance(billing.get("token_prices"), dict) else {}
+        default_prices = token_prices.get("default") if isinstance(token_prices.get("default"), dict) else {}
+        input_price = default_prices.get("input_price")
+        output_price = default_prices.get("output_price")
+        cache_read_price = default_prices.get("cache_read_price")
+        if not isinstance(input_price, (int, float)) or not isinstance(output_price, (int, float)):
+            continue
+        if input_price == 0 and output_price == 0:
+            continue  # a free/retired/embedding entry, not a priced chat model worth overriding with
+        slug = _slug(model_id)
+        MODEL_PRICING_BY_SLUG[slug] = {
+            "input": input_price / 100,
+            "cached_input": (cache_read_price / 100) if isinstance(cache_read_price, (int, float)) else 0.0,
+            "output": output_price / 100,
+        }
+        name = model.get("name")
+        if isinstance(name, str) and name:
+            MODEL_PRICING_DISPLAY[slug] = name
+
+
 def lookup_pricing(pricing_key: str | None) -> dict[str, float]:
     if pricing_key:
         rates = MODEL_PRICING_BY_SLUG.get(_slug(str(pricing_key)))
@@ -482,12 +557,123 @@ def extract_session(doc: dict, workspace: str, catalog: dict[str, dict[str, Any]
         "credits": round(credits, 4),
         "inputTokens": input_tokens or None,
         "outputTokens": output_tokens or None,
+        "cachedTokens": None,  # not exposed anywhere in the Chat panel's own logs (see read_copilot_cli_sessions)
         "contextWindow": model_context_window(last_model_for_display, catalog),
         "genMs": gen_ms or None,
         "runtimeMs": runtime_ms,
         "createdAt": iso_from_epoch_ms(created_at),
         "updatedAt": iso_from_epoch_ms(updated_at),
     }
+
+
+def _cli_iso(value: Any) -> str | None:
+    """Normalize the CLI store's `...Z`-suffixed timestamps to the `+00:00` form used elsewhere,
+    so datetime.fromisoformat() (used by _sort_key and here) parses them on Python < 3.11 too."""
+    if not isinstance(value, str) or not value:
+        return None
+    return value[:-1] + "+00:00" if value.endswith("Z") else value
+
+
+def read_copilot_cli_sessions(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Best-effort read of the standalone GitHub Copilot CLI's own session history.
+
+    This is a different product from the Copilot Chat panel sessions above (see
+    resolve_copilot_cli_dir()), but its local SQLite store records something the panel's own
+    JSONL logs never do: per-request cache_read/cache_write token counts and a ready-made cost
+    figure per request (`total_nano_aiu`). 1 credit = 1_000_000_000 nano-AIU here, which lines up
+    exactly with this dashboard's existing 1 credit = $0.01 (verified against the model catalog's
+    own published per-token rates), so this is used as-is instead of re-estimating it. Schema is
+    undocumented and can change between Copilot CLI releases, so every read here is defensive.
+    """
+    conn = _open_ro_sqlite(resolve_copilot_cli_dir() / "session-store.db")
+    if conn is None:
+        return []
+    try:
+        session_rows = conn.execute(
+            "SELECT id, cwd, repository, summary, created_at, updated_at FROM sessions"
+        ).fetchall()
+        turn_rows = conn.execute("SELECT session_id, timestamp FROM turns").fetchall()
+        usage_rows = conn.execute(
+            "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, "
+            "duration_ms, total_nano_aiu FROM assistant_usage_events"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    turn_counts: dict[str, int] = {}
+    turn_span: dict[str, list[str]] = {}
+    for session_id, timestamp in turn_rows:
+        turn_counts[session_id] = turn_counts.get(session_id, 0) + 1
+        iso = _cli_iso(timestamp)
+        if iso:
+            span = turn_span.setdefault(session_id, [iso, iso])
+            span[0] = min(span[0], iso)
+            span[1] = max(span[1], iso)
+
+    usage_by_session: dict[str, dict[str, Any]] = {}
+    for session_id, model, in_tok, out_tok, cache_read, duration_ms, nano_aiu in usage_rows:
+        agg = usage_by_session.setdefault(
+            session_id,
+            {"inputTokens": 0, "outputTokens": 0, "cachedTokens": 0, "genMs": 0.0, "credits": 0.0, "models": {}},
+        )
+        agg["inputTokens"] += in_tok or 0
+        agg["outputTokens"] += out_tok or 0
+        agg["cachedTokens"] += cache_read or 0
+        agg["genMs"] += duration_ms or 0
+        agg["credits"] += (nano_aiu or 0) / 1_000_000_000
+        if model:
+            agg["models"][model] = agg["models"].get(model, 0) + 1
+
+    sessions: list[dict[str, Any]] = []
+    for session_id, cwd, repository, summary, created_at, updated_at in session_rows:
+        usage = usage_by_session.get(session_id, {})
+        message_count = turn_counts.get(session_id, 0)
+        title = summary.strip() if isinstance(summary, str) and summary.strip() else "(untitled)"
+        if title == "(untitled)" and not message_count:
+            continue  # hidden empty, mirrors the classic session logs' own rule
+
+        if isinstance(cwd, str) and cwd:
+            workspace = Path(cwd).name or cwd
+        elif isinstance(repository, str) and repository:
+            workspace = repository
+        else:
+            workspace = "(no workspace)"
+
+        models = usage.get("models") or {}
+        top_model = max(models, key=models.get) if models else None
+
+        span = turn_span.get(session_id)
+        runtime_ms = None
+        if span:
+            try:
+                start = datetime.fromisoformat(span[0])
+                end = datetime.fromisoformat(span[1])
+                runtime_ms = (end - start).total_seconds() * 1000
+            except ValueError:
+                runtime_ms = None
+
+        sessions.append(
+            {
+                "id": session_id,
+                "title": title,
+                "workspace": workspace,
+                "mode": "cli",
+                "model": display_model_name(top_model, catalog),
+                "messages": message_count,
+                "credits": round(usage.get("credits", 0.0), 4),
+                "inputTokens": usage.get("inputTokens") or None,
+                "outputTokens": usage.get("outputTokens") or None,
+                "cachedTokens": usage.get("cachedTokens") or None,
+                "contextWindow": model_context_window(top_model, catalog),
+                "genMs": usage.get("genMs") or None,
+                "runtimeMs": runtime_ms,
+                "createdAt": _cli_iso(created_at),
+                "updatedAt": _cli_iso(updated_at) or _cli_iso(created_at),
+            }
+        )
+    return sessions
 
 
 def _sort_key(session: dict[str, Any]) -> float:
@@ -510,17 +696,22 @@ def read_state(user_dir: Path) -> dict[str, Any]:
         harvest_model_catalog(doc, catalog)
         parsed.append((doc, workspace, jsonl_path.stem))
 
+    load_live_model_pricing(user_dir)
+
     sessions: list[dict[str, Any]] = []
     for doc, workspace, fallback_id in parsed:
         session = extract_session(doc, workspace, catalog, fallback_id)
         if session is not None:
             sessions.append(session)
 
+    hidden_empty = len(parsed) - len(sessions)
+    sessions.extend(read_copilot_cli_sessions(catalog))
+
     sessions.sort(key=_sort_key, reverse=True)
     return {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "userDir": str(user_dir),
-        "hiddenEmpty": len(parsed) - len(sessions),
+        "hiddenEmpty": hidden_empty,
         "plan": {
             "name": resolve_plan_name(user_dir) or FALLBACK_PLAN_NAME,
             "limit": 0,  # no local cache of a numeric monthly quota exists for any plan tier
@@ -539,8 +730,8 @@ const CREDIT_USD_RATE=__CREDIT_USD_RATE__;
 const state={data:null,sort:'updatedAt',desc:true};const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const date=v=>v?new Date(v).toLocaleString([], {dateStyle:'medium',timeStyle:'short'}):'—';const dte=v=>v?new Date(v).toLocaleDateString([], {dateStyle:'medium'}):'—';const dmy=v=>{if(!v)return'—';const d=new Date(v);return`${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}/${String(d.getFullYear()).slice(-2)}`};const fmt=v=>v==null?'—':Number(v).toLocaleString();const dur=v=>{if(v==null)return'—';const s=Math.round(Number(v)/1000);if(s<60)return`${s}s`;const m=Math.floor(s/60);if(m<60)return`${m}m ${s%60}s`;return`${(s/3600).toFixed(1)}h`};
 function render(){closeShareMenu();hideTip();const d=state.data,p=d.plan||{},rate=CREDIT_USD_RATE;const now=new Date(),monthSessions=(d.sessions||[]).filter(s=>{const t=s.createdAt?new Date(s.createdAt):null;return t&&t.getMonth()===now.getMonth()&&t.getFullYear()===now.getFullYear()});const consumed=monthSessions.reduce((a,s)=>a+(Number(s.credits)||0),0),est=(consumed*rate).toFixed(2);const tokIn=monthSessions.reduce((a,s)=>a+(Number(s.inputTokens)||0),0),tokOut=monthSessions.reduce((a,s)=>a+(Number(s.outputTokens)||0),0),modelCounts={},modelTok={},modelCredits={};monthSessions.forEach(s=>{if(s.model&&s.model!=='—'){modelCounts[s.model]=(modelCounts[s.model]||0)+1;modelTok[s.model]=(modelTok[s.model]||0)+(Number(s.inputTokens)||0)+(Number(s.outputTokens)||0);modelCredits[s.model]=(modelCredits[s.model]||0)+(Number(s.credits)||0)}});const top=o=>Object.entries(o).sort((a,b)=>b[1]-a[1])[0],topTok=top(modelTok),topCred=top(modelCredits),topCnt=top(modelCounts);
-$('source').textContent=`Local VS Code Copilot Chat sessions · ${(d.sessions||[]).length} total`;$('asof').textContent=`Last update: ${date(d.generatedAt)}`;let rows=d.sessions||[];const prevSearch=$('search'),raw=prevSearch?.value||'',q=raw.toLowerCase(),focused=prevSearch&&document.activeElement===prevSearch,caret=prevSearch?.selectionStart;if(q)rows=rows.filter(s=>[s.title,s.workspace,s.id,s.model,s.mode].join(' ').toLowerCase().includes(q));rows.sort((a,b)=>{const v=s=>state.sort==='cost'?(s.credits==null?'':s.credits*rate):s[state.sort];let x=v(a)??'',y=v(b)??'';if(state.sort.includes('At')){x=new Date(x||0).getTime();y=new Date(y||0).getTime()}else if(typeof x==='string'){x=x.toLowerCase();y=String(y).toLowerCase()}return (x<y?-1:x>y?1:0)*(state.desc?-1:1)});
-$('app').innerHTML=`<section class="grid"><article class="card"><div class="card-label">Plan</div><div class="metric">${esc(p.name)}</div>${p.account?`<div class="muted">@${esc(p.account)}</div>`:''}<div class="card-label" style="margin-top:14px">Estimated cost (this month)</div><div class="metric">$${est}</div><div class="muted">$${rate.toFixed(2)} / credit</div></article><article class="card"><div class="card-label">Credits consumed</div><div class="metric">${consumed.toFixed(2)}</div><div class="muted">Unlimited plan allotment</div><div class="muted">Estimated locally from logged token usage</div></article><article class="card"><div class="card-label">Sessions this month</div><div class="metric">${fmt(monthSessions.length)}</div><div class="muted">Tokens:</div><div class="muted">IN ${fmt(tokIn)} · OUT ${fmt(tokOut)}</div></article><article class="card"><div class="card-label">Model metrics</div><div class="metric">${fmt(Object.keys(modelCounts).length)}</div><div class="muted">Top by tokens: ${topTok?esc(topTok[0])+' · '+fmt(topTok[1]):'—'}</div><div class="muted">Top by credits: ${topCred?esc(topCred[0])+' · '+topCred[1].toFixed(2):'—'}</div><div class="muted">Top by count: ${topCnt?esc(topCnt[0])+' · '+fmt(topCnt[1]):'—'}</div></article></section><section class="panel"><div class="panel-head"><div><h2>Sessions <span class="muted">(${rows.length!==d.sessions.length?`${rows.length} of `:''}${d.sessions.length} Total)</span></h2></div><div class="controls"><input class="input search" id="search" placeholder="Search title, workspace, model…" value="${esc(raw)}"></div></div><div class="table-wrap"><table class="session-table"><thead><tr><th class="no-sort share-col"></th>${[['updatedAt','Last updated'],['workspace','Workspace'],['title','Title'],['model','Model'],['mode','Mode'],['credits','Credits'],['cost','Est. cost'],['inputTokens','Tokens in'],['outputTokens','Tokens out'],['contextWindow','Context'],['genMs','Gen. time'],['runtimeMs','Runtime'],['createdAt','Created'],['messages',MESSAGE_ICON_SVG]].map(([k,l])=>`<th data-sort="${k}">${l}${state.sort===k?' '+(state.desc?'↓':'↑'):''}</th>`).join('')}</tr></thead><tbody>${rows.map(s=>`<tr><td class="nowrap share-col"><button class="share-btn" data-id="${esc(s.id)}" title="Share" aria-label="Share session">${SHARE_ICON_SVG}</button></td><td class="nowrap updated">${date(s.updatedAt)}</td><td class="workspace">${esc(s.workspace||'—')}</td><td class="title">${esc(s.title)}</td><td>${esc(s.model||'—')}</td><td class="nowrap"><span class="badge">${esc(s.mode||'—')}</span></td><td class="nowrap">${s.credits==null?'—':s.credits.toFixed(3)}</td><td class="nowrap">${s.credits==null?'—':'$'+(s.credits*rate).toFixed(2)}</td><td class="nowrap">${fmt(s.inputTokens)}</td><td class="nowrap">${fmt(s.outputTokens)}</td><td class="nowrap">${fmt(s.contextWindow)}</td><td class="nowrap">${dur(s.genMs)}</td><td class="nowrap">${dur(s.runtimeMs)}</td><td class="nowrap">${dmy(s.createdAt)}</td><td class="messages">${s.messages}</td></tr>`).join('')||'<tr><td colspan="15" class="muted">No sessions match this search.</td></tr>'}</tbody></table></div><div class="footer muted">${d.sessions.length} sessions loaded from local VS Code Copilot Chat logs.${d.hiddenEmpty?' '+d.hiddenEmpty+' empty sessions (no title, no messages) hidden.':''} Credits are estimated locally from logged token usage using GitHub's published per-model rates; this is not the authoritative total from your GitHub account.</div></section>`;
+$('source').textContent=`Local Copilot sessions (Chat panel + CLI) · ${(d.sessions||[]).length} total`;$('asof').textContent=`Last update: ${date(d.generatedAt)}`;let rows=d.sessions||[];const prevSearch=$('search'),raw=prevSearch?.value||'',q=raw.toLowerCase(),focused=prevSearch&&document.activeElement===prevSearch,caret=prevSearch?.selectionStart;if(q)rows=rows.filter(s=>[s.title,s.workspace,s.id,s.model,s.mode].join(' ').toLowerCase().includes(q));rows.sort((a,b)=>{const v=s=>state.sort==='cost'?(s.credits==null?'':s.credits*rate):s[state.sort];let x=v(a)??'',y=v(b)??'';if(state.sort.includes('At')){x=new Date(x||0).getTime();y=new Date(y||0).getTime()}else if(typeof x==='string'){x=x.toLowerCase();y=String(y).toLowerCase()}return (x<y?-1:x>y?1:0)*(state.desc?-1:1)});
+$('app').innerHTML=`<section class="grid"><article class="card"><div class="card-label">Plan</div><div class="metric">${esc(p.name)}</div>${p.account?`<div class="muted">@${esc(p.account)}</div>`:''}<div class="card-label" style="margin-top:14px">Estimated cost (this month)</div><div class="metric">$${est}</div><div class="muted">$${rate.toFixed(2)} / credit</div></article><article class="card"><div class="card-label">Credits consumed</div><div class="metric">${consumed.toFixed(2)}</div><div class="muted">Unlimited plan allotment</div><div class="muted">Estimated locally from logged token usage</div></article><article class="card"><div class="card-label">Sessions this month</div><div class="metric">${fmt(monthSessions.length)}</div><div class="muted">Tokens:</div><div class="muted">IN ${fmt(tokIn)} · OUT ${fmt(tokOut)}</div></article><article class="card"><div class="card-label">Model metrics</div><div class="metric">${fmt(Object.keys(modelCounts).length)}</div><div class="muted">Top by tokens: ${topTok?esc(topTok[0])+' · '+fmt(topTok[1]):'—'}</div><div class="muted">Top by credits: ${topCred?esc(topCred[0])+' · '+topCred[1].toFixed(2):'—'}</div><div class="muted">Top by count: ${topCnt?esc(topCnt[0])+' · '+fmt(topCnt[1]):'—'}</div></article></section><section class="panel"><div class="panel-head"><div><h2>Sessions <span class="muted">(${rows.length!==d.sessions.length?`${rows.length} of `:''}${d.sessions.length} Total)</span></h2></div><div class="controls"><input class="input search" id="search" placeholder="Search title, workspace, model…" value="${esc(raw)}"></div></div><div class="table-wrap"><table class="session-table"><thead><tr><th class="no-sort share-col"></th>${[['updatedAt','Last updated'],['workspace','Workspace'],['title','Title'],['model','Model'],['mode','Mode'],['credits','Credits'],['cost','Est. cost'],['inputTokens','Tokens in'],['outputTokens','Tokens out'],['cachedTokens','Cached'],['contextWindow','Context'],['genMs','Gen. time'],['runtimeMs','Runtime'],['createdAt','Created'],['messages',MESSAGE_ICON_SVG]].map(([k,l])=>`<th data-sort="${k}">${l}${state.sort===k?' '+(state.desc?'↓':'↑'):''}</th>`).join('')}</tr></thead><tbody>${rows.map(s=>`<tr><td class="nowrap share-col"><button class="share-btn" data-id="${esc(s.id)}" title="Share" aria-label="Share session">${SHARE_ICON_SVG}</button></td><td class="nowrap updated">${date(s.updatedAt)}</td><td class="workspace">${esc(s.workspace||'—')}</td><td class="title">${esc(s.title)}</td><td>${esc(s.model||'—')}</td><td class="nowrap"><span class="badge">${esc(s.mode||'—')}</span></td><td class="nowrap">${s.credits==null?'—':s.credits.toFixed(3)}</td><td class="nowrap">${s.credits==null?'—':'$'+(s.credits*rate).toFixed(2)}</td><td class="nowrap">${fmt(s.inputTokens)}</td><td class="nowrap">${fmt(s.outputTokens)}</td><td class="nowrap">${fmt(s.cachedTokens)}</td><td class="nowrap">${fmt(s.contextWindow)}</td><td class="nowrap">${dur(s.genMs)}</td><td class="nowrap">${dur(s.runtimeMs)}</td><td class="nowrap">${dmy(s.createdAt)}</td><td class="messages">${s.messages}</td></tr>`).join('')||'<tr><td colspan="16" class="muted">No sessions match this search.</td></tr>'}</tbody></table></div><div class="footer muted">${d.sessions.length} sessions loaded from local VS Code Copilot Chat logs and the Copilot CLI's own session history.${d.hiddenEmpty?' '+d.hiddenEmpty+' empty sessions (no title, no messages) hidden.':''} Chat panel credits are estimated locally from logged token usage using GitHub's published per-model rates; CLI sessions (mode "cli") use the CLI's own already-computed cost. Neither is the authoritative total from your GitHub account.</div></section>`;
 $('search').addEventListener('input',render);document.querySelectorAll('[data-sort]').forEach(el=>el.addEventListener('click',()=>{if(state.sort===el.dataset.sort)state.desc=!state.desc;else{state.sort=el.dataset.sort;state.desc=true}render()}));const search=$('search');if(search&&focused){search.focus();search.setSelectionRange(caret??raw.length,caret??raw.length)}}
 const SHARE_ICON_SVG='<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.6v7.9"/><polyline points="4.9 4.8 8 1.6 11.1 4.8"/><path d="M4.6 6.6H3.6a1 1 0 0 0-1 1v5.8a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V7.6a1 1 0 0 0-1-1h-1"/></svg>';
 const MESSAGE_ICON_SVG='<span title="Messages" aria-label="Messages" style="display:inline-flex;vertical-align:middle"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10.5a1.5 1.5 0 0 1-1.5 1.5H5l-3 2.5V3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5z"/></svg></span>';
@@ -550,7 +741,7 @@ function shareFileDate(s){const v=s.createdAt||s.updatedAt;const d=v?new Date(v)
 function shareSanitize(v){return String(v||'').replace(/[\\/:*?"<>|\x00-\x1f]/g,'-').replace(/\s+/g,' ').replace(/^[.\s]+/,'').replace(/[.\s]+$/,'').slice(0,80).trim()}
 function shareFilename(s){let base=shareSanitize(s.title);if(!base||base==='(untitled)')base=shareSanitize(s.id)||'session';return`${base} ${shareFileDate(s)}.md`}
 function estCost(s){return s.credits==null?'—':'$'+(s.credits*CREDIT_USD_RATE).toFixed(2)}
-function sessionMarkdown(s){const pipe=v=>String(v??'').replace(/\|/g,'\\|');const val=v=>pipe(v==null||v===''?'—':v);return['# '+pipe(s.title||'(untitled)'),'','| Field | Value |','| --- | --- |','| Session ID | '+val(s.id)+' |','| Workspace | '+val(s.workspace)+' |','| Mode | '+val(s.mode)+' |','| Model | '+val(s.model)+' |','| Messages | '+val(s.messages)+' |','| Credits consumed | '+(s.credits==null?'—':s.credits.toFixed(3))+' |','| Est. cost | '+estCost(s)+' |','| Tokens in | '+fmt(s.inputTokens)+' |','| Tokens out | '+fmt(s.outputTokens)+' |','| Context window | '+fmt(s.contextWindow)+' |','| Gen. time | '+dur(s.genMs)+' |','| Runtime | '+dur(s.runtimeMs)+' |','| Created | '+date(s.createdAt)+' |','| Last updated | '+date(s.updatedAt)+' |','','Estimated at $'+CREDIT_USD_RATE.toFixed(2)+' / credit from locally logged token usage.'].join('\n')}
+function sessionMarkdown(s){const pipe=v=>String(v??'').replace(/\|/g,'\\|');const val=v=>pipe(v==null||v===''?'—':v);return['# '+pipe(s.title||'(untitled)'),'','| Field | Value |','| --- | --- |','| Session ID | '+val(s.id)+' |','| Workspace | '+val(s.workspace)+' |','| Mode | '+val(s.mode)+' |','| Model | '+val(s.model)+' |','| Messages | '+val(s.messages)+' |','| Credits consumed | '+(s.credits==null?'—':s.credits.toFixed(3))+' |','| Est. cost | '+estCost(s)+' |','| Tokens in | '+fmt(s.inputTokens)+' |','| Tokens out | '+fmt(s.outputTokens)+' |','| Tokens cached | '+fmt(s.cachedTokens)+' |','| Context window | '+fmt(s.contextWindow)+' |','| Gen. time | '+dur(s.genMs)+' |','| Runtime | '+dur(s.runtimeMs)+' |','| Created | '+date(s.createdAt)+' |','| Last updated | '+date(s.updatedAt)+' |','','Estimated at $'+CREDIT_USD_RATE.toFixed(2)+' / credit from locally logged token usage.'].join('\n')}
 async function copySessionJson(s){const text=JSON.stringify({...s,creditUsdRate:CREDIT_USD_RATE,estimatedCostUsd:s.credits==null?null:Number((s.credits*CREDIT_USD_RATE).toFixed(2))},null,2);try{await navigator.clipboard.writeText(text);return}catch(e){}const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy')}catch(e){}ta.remove()}
 function downloadSessionMarkdown(s){const blob=new Blob([sessionMarkdown(s)],{type:'text/markdown'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=shareFilename(s);document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}
 function openShareMenu(btn,s){closeShareMenu();const el=document.createElement('div');el.className='share-menu';const copy=document.createElement('button');copy.type='button';copy.textContent='Copy JSON';const dl=document.createElement('button');dl.type='button';dl.textContent='Download .md file';el.append(copy,dl);document.body.appendChild(el);const r=btn.getBoundingClientRect(),w=el.offsetWidth,h=el.offsetHeight;let top=r.bottom+6,left=r.right-w;if(top+h>window.innerHeight-8&&r.top-h-6>=8)top=r.top-h-6;left=Math.max(8,Math.min(left,window.innerWidth-w-8));el.style.top=top+'px';el.style.left=left+'px';const onDoc=e=>{if(!el.contains(e.target)&&e.target!==btn)closeShareMenu()};const onKey=e=>{if(e.key==='Escape')closeShareMenu()};document.addEventListener('click',onDoc,true);document.addEventListener('keydown',onKey);shareMenu={el,onDoc,onKey};copy.addEventListener('click',async()=>{await copySessionJson(s);copy.textContent='Copied!';setTimeout(closeShareMenu,1000)});dl.addEventListener('click',()=>{downloadSessionMarkdown(s);closeShareMenu()})}
