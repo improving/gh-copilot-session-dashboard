@@ -452,6 +452,11 @@ def load_live_model_pricing(user_dir: Path) -> list[dict[str, Any]]:
                 if count:
                     item["maxInputTokens"] = count
                     break
+            capabilities = model.get("capabilities") if isinstance(model.get("capabilities"), dict) else {}
+            limits = capabilities.get("limits") if isinstance(capabilities.get("limits"), dict) else {}
+            prompt_limit = _valid_count(limits.get("max_prompt_tokens"))
+            if prompt_limit:
+                item["promptLimit"] = prompt_limit
             entries[_slug(model_id)] = item
         if entries:
             snapshots.append({"path": str(path), "capturedAt": captured, "models": entries})
@@ -948,11 +953,63 @@ def read_copilot_cli_sessions(catalog: dict[str, dict[str, Any]]) -> list[dict[s
     return result
 
 
-def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]],
-                                    known_ids: set[str]) -> list[dict[str, Any]]:
+_EVENT_ACTIVITY_TYPES = ("user.message", "assistant.", "tool.execution_", "session.usage_record")
+
+
+def _event_usage_record(kind: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    """Per-call usage from `session.usage_record` (newer CLI) or `assistant.usage` events."""
+    usage = data.get("usage") if kind == "session.usage_record" else data
+    if not isinstance(usage, dict):
+        return None
+    copilot_usage = usage.get("copilotUsage") if isinstance(usage.get("copilotUsage"), dict) else {}
+    model = usage.get("model")
+    return {"model": model if isinstance(model, str) and model else None,
+            "callId": usage.get("apiCallId") if isinstance(usage.get("apiCallId"), str) else None,
+            "inputTokens": _valid_count(usage.get("inputTokens")),
+            "outputTokens": _valid_count(usage.get("outputTokens")),
+            "cachedTokens": _valid_count(usage.get("cacheReadTokens")),
+            "cacheWriteTokens": _valid_count(usage.get("cacheWriteTokens")),
+            "durationMs": _valid_rate(usage.get("duration")),
+            "nanoAiu": _valid_count(copilot_usage.get("totalNanoAiu")),
+            "contextLimit": _valid_count(usage.get("maxPromptTokens"))}
+
+
+def _shutdown_model_totals(data: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Cumulative per-model totals from `session.shutdown` (the CLI restores them on resume)."""
+    totals: dict[str, dict[str, int]] = {}
+    metrics = data.get("modelMetrics")
+    if not isinstance(metrics, dict):
+        return totals
+    for model, entry in metrics.items():
+        if not isinstance(model, str) or not isinstance(entry, dict):
+            continue
+        usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+        totals[model] = {"inputTokens": _valid_count(usage.get("inputTokens")) or 0,
+                         "outputTokens": _valid_count(usage.get("outputTokens")) or 0,
+                         "cachedTokens": _valid_count(usage.get("cacheReadTokens")) or 0,
+                         "cacheWriteTokens": _valid_count(usage.get("cacheWriteTokens")) or 0,
+                         "nanoAiu": _valid_count(entry.get("totalNanoAiu")) or 0}
+    return totals
+
+
+def _event_context_limit(model_id: str | None, catalog: dict[str, dict[str, Any]],
+                         snapshots: list[dict[str, Any]]) -> int | None:
+    """Prompt-token limit for a model: newest cached catalog `capabilities.limits`, then the catalog."""
+    if not model_id:
+        return None
+    for snapshot in reversed(snapshots):
+        limit = snapshot["models"].get(_slug(model_id), {}).get("promptLimit")
+        if limit:
+            return limit
+    return model_context_window(model_id, catalog)
+
+
+def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]], known_ids: set[str],
+                                    snapshots: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Parse ~/.copilot/session-state/<id>/events.jsonl — the store used by Copilot
     sessions launched from VS Code's Agents window, which never land in session-store.db.
-    The log has no per-call token counts; only cumulative nano-AIU (credits) checkpoints."""
+    Per-call tokens come from `session.usage_record`/`assistant.usage` when logged; otherwise
+    from the cumulative `session.shutdown` model metrics, split per process segment."""
     state_dir = resolve_copilot_cli_dir() / "session-state"
     if not state_dir.is_dir():
         return []
@@ -969,6 +1026,71 @@ def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]],
         nano_aiu: int | None = None
         message_count = 0
         activity: list[dict[str, Any]] = []
+        # A segment is one CLI process lifetime, closed by session.shutdown.
+        segment_messages: list[dict[str, Any]] = []
+        segment_usage: list[dict[str, Any]] = []
+        seen_call_ids: set[str] = set()
+        baseline: dict[str, dict[str, int]] = {}
+        last_shutdown: dict[str, Any] | None = None
+        usage_after_shutdown_ms = 0.0
+        usage_after_shutdown_count = 0
+        context: dict[str, Any] | None = None
+        busy_ms = 0.0
+        span_start: datetime | None = None
+        span_end: datetime | None = None
+        last_active: str | None = None
+
+        def call_row(stamp: str | None, model: str | None, record: dict[str, Any] | None,
+                     source: str | None) -> dict[str, Any]:
+            nano = record.get("nanoAiu") if record else None
+            input_tokens = record.get("inputTokens") if record else None
+            cached = record.get("cachedTokens") if record else None
+            if cached is not None and (input_tokens is None or cached > input_tokens):
+                cached = None
+            return {"timestamp": stamp, "model": display_model_name(model, catalog),
+                    "inputTokens": input_tokens, "outputTokens": record.get("outputTokens") if record else None,
+                    "cachedTokens": cached, "cacheWriteTokens": record.get("cacheWriteTokens") if record else None,
+                    "credits": nano / 1_000_000_000 if nano is not None else None,
+                    "creditsQuality": "reported" if nano is not None else "unavailable",
+                    "priceSource": source if nano is not None else None,
+                    "modelAttribution": "observed" if model else None}
+
+        def close_segment(shutdown: dict[str, Any] | None, stamp: str | None) -> None:
+            nonlocal baseline
+            if segment_usage:
+                activity.extend(call_row(r["timestamp"], r["model"], r, "Copilot CLI usage record totalNanoAiu")
+                                for r in segment_usage)
+            else:
+                rows = [call_row(m["timestamp"], m["model"], None, None) for m in segment_messages]
+                if shutdown is not None:
+                    totals = _shutdown_model_totals(shutdown)
+                    for model, total in totals.items():
+                        delta = {k: max(0, v - baseline.get(model, {}).get(k, 0)) for k, v in total.items()}
+                        if not any(delta.values()):
+                            continue
+                        owners = [i for i, m in enumerate(segment_messages) if m["model"] == model]
+                        if not owners:
+                            rows.append(call_row(stamp, model, None, None))
+                            owners = [len(rows) - 1]
+                        # Shutdown metrics are per segment, not per call: attribute the segment
+                        # delta to the model's last call and zero its other calls.
+                        for i in owners[:-1]:
+                            rows[i] = call_row(rows[i]["timestamp"], model, dict.fromkeys(delta, 0),
+                                               "Copilot CLI session.shutdown totalNanoAiu (segment aggregate)")
+                        rows[owners[-1]] = call_row(rows[owners[-1]]["timestamp"], model, delta,
+                                                    "Copilot CLI session.shutdown totalNanoAiu (segment aggregate)")
+                activity.extend(rows)
+            if shutdown is not None:
+                baseline = _shutdown_model_totals(shutdown) or baseline
+            segment_messages.clear()
+            segment_usage.clear()
+
+        def close_span() -> None:
+            nonlocal busy_ms, span_start, span_end
+            if span_start and span_end and span_end > span_start:
+                busy_ms += (span_end - span_start).total_seconds() * 1000
+            span_start = span_end = None
+
         try:
             with events_path.open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -984,11 +1106,21 @@ def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]],
                     data = event.get("data")
                     data = data if isinstance(data, dict) else {}
                     kind = event.get("type")
+                    kind = kind if isinstance(kind, str) else ""
+                    moment = datetime.fromisoformat(stamp) if stamp else None
+                    if moment and kind.startswith(_EVENT_ACTIVITY_TYPES):
+                        last_active = stamp
+                        if kind == "user.message":
+                            close_span()
+                        span_start = span_start or moment
+                        span_end = max(span_end or moment, moment)
+                    if kind in ("session.shutdown", "session.resume", "session.start"):
+                        close_span()
                     if kind == "session.start":
                         created_at = created_at or _cli_iso(data.get("startTime")) or stamp
-                        context = data.get("context")
-                        if isinstance(context, dict) and isinstance(context.get("cwd"), str):
-                            cwd = context["cwd"]
+                        start_context = data.get("context")
+                        if isinstance(start_context, dict) and isinstance(start_context.get("cwd"), str):
+                            cwd = start_context["cwd"]
                         model = data.get("selectedModel")
                         if isinstance(model, str) and model:
                             models[model] = models.get(model, 0) + 1
@@ -1002,43 +1134,85 @@ def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]],
                         model = model if isinstance(model, str) and model else None
                         if model:
                             models[model] = models.get(model, 0) + 1
-                        activity.append({"timestamp": stamp, "model": display_model_name(model, catalog),
-                                         "inputTokens": None, "outputTokens": None, "cachedTokens": None,
-                                         "cacheWriteTokens": None, "credits": None,
-                                         "creditsQuality": "unavailable", "priceSource": None,
-                                         "modelAttribution": "observed" if model else None})
+                        segment_messages.append({"timestamp": stamp, "model": model})
+                    elif kind in ("session.usage_record", "assistant.usage"):
+                        record = _event_usage_record(kind, data)
+                        if record is None or (record["callId"] and record["callId"] in seen_call_ids):
+                            continue
+                        if record["callId"]:
+                            seen_call_ids.add(record["callId"])
+                        record["timestamp"] = stamp
+                        segment_usage.append(record)
+                        if record["durationMs"] is not None:
+                            usage_after_shutdown_ms += record["durationMs"]
+                            usage_after_shutdown_count += 1
+                        if record["inputTokens"] is not None:
+                            current = record["inputTokens"] + (record["outputTokens"] or 0)
+                            limit = record["contextLimit"] or _event_context_limit(record["model"], catalog, snapshots or [])
+                            context = {"currentTokens": current, "tokenLimit": limit,
+                                       "percent": round(current * 100 / limit, 1) if limit else None,
+                                       "source": "Copilot CLI usage record (latest call prompt + output)"}
                     elif kind == "session.usage_checkpoint":
                         value = _valid_count(data.get("totalNanoAiu"))
                         if value is not None:
                             nano_aiu = max(nano_aiu or 0, value)
+                    elif kind == "session.shutdown":
+                        close_segment(data, stamp)
+                        last_shutdown = data
+                        usage_after_shutdown_ms, usage_after_shutdown_count = 0.0, 0
+                        current = _valid_count(data.get("currentTokens"))
+                        if current is not None:
+                            model = data.get("currentModel") if isinstance(data.get("currentModel"), str) else None
+                            limit = _event_context_limit(model, catalog, snapshots or [])
+                            context = {"currentTokens": current, "tokenLimit": limit,
+                                       "percent": round(current * 100 / limit, 1) if limit else None,
+                                       "source": "Copilot CLI session.shutdown currentTokens"
+                                                 + ("; configured model context limit" if limit else "")}
         except OSError:
             continue
+        close_span()
+        close_segment(None, last_stamp)
         if not activity and not message_count and created_at is None:
             continue
         workspace = Path(cwd).name or cwd if cwd else "(no workspace)"
         top_model = max(models, key=models.get) if models else None
-        runtime_ms = None
-        if created_at and last_stamp:
-            try:
-                runtime_ms = (datetime.fromisoformat(last_stamp)
-                              - datetime.fromisoformat(created_at)).total_seconds() * 1000
-            except ValueError:
-                pass
+
+        def known_sum(field: str) -> int | None:
+            values = [row[field] for row in activity if row[field] is not None]
+            return sum(values) if values else None
+        token_known = bool(activity) and all(row["inputTokens"] is not None and row["outputTokens"] is not None
+                                              for row in activity)
+        gen_ms = None
+        if last_shutdown is not None and _valid_rate(last_shutdown.get("totalApiDurationMs")) is not None:
+            gen_ms = _valid_rate(last_shutdown.get("totalApiDurationMs")) + usage_after_shutdown_ms
+        elif usage_after_shutdown_count:
+            gen_ms = usage_after_shutdown_ms
+        price_sources = sorted({row["priceSource"] for row in activity if row.get("priceSource")})
+        if nano_aiu is not None and "Copilot CLI total_nano_aiu" not in price_sources:
+            price_sources.append("Copilot CLI total_nano_aiu")
+        credits, credits_quality = (nano_aiu / 1_000_000_000, "reported") if nano_aiu is not None else (None, "unavailable")
+        credits_source = "Copilot CLI session.usage_checkpoint totalNanoAiu"
+        call_credits = [row["credits"] for row in activity if row["credits"] is not None]
+        if credits is None and call_credits:
+            credits = sum(call_credits)
+            credits_quality = "reported" if len(call_credits) == len(activity) else "partial"
+            credits_source = "Copilot CLI per-call totalNanoAiu"
         sessions.append({
             "id": session_id, "title": title or "(untitled)", "workspace": workspace,
             "mode": cli_session_mode(session_id), "model": display_model_name(top_model, catalog),
             "messages": message_count,
-            "credits": round(nano_aiu / 1_000_000_000, 6) if nano_aiu is not None else None,
-            "creditsQuality": "reported" if nano_aiu is not None else "unavailable",
-            "creditsSource": "Copilot CLI session.usage_checkpoint totalNanoAiu",
-            "inputTokens": None, "outputTokens": None, "cachedTokens": None,
-            "cacheWriteTokens": None, "tokenQuality": "partial",
-            "contextUsage": None, "contextWindow": None, "currentContextTokens": None,
-            "genMs": None, "runtimeMs": runtime_ms,
-            "createdAt": created_at, "updatedAt": last_stamp or created_at,
+            "credits": round(credits, 6) if credits is not None else None,
+            "creditsQuality": credits_quality, "creditsSource": credits_source,
+            "inputTokens": known_sum("inputTokens"), "outputTokens": known_sum("outputTokens"),
+            "cachedTokens": known_sum("cachedTokens"), "cacheWriteTokens": known_sum("cacheWriteTokens"),
+            "tokenQuality": "exact" if token_known else "partial",
+            "contextUsage": context, "contextWindow": context.get("tokenLimit") if context else None,
+            "currentContextTokens": context.get("currentTokens") if context else None,
+            "genMs": gen_ms, "runtimeMs": busy_ms if busy_ms > 0 else None,
+            "createdAt": created_at, "updatedAt": last_active or last_stamp or created_at,
             "activity": activity,
             "untimestampedCalls": sum(1 for event in activity if event["timestamp"] is None),
-            "priceSources": ["Copilot CLI total_nano_aiu"] if nano_aiu is not None else [],
+            "priceSources": price_sources,
         })
     return sessions
 
@@ -1082,7 +1256,7 @@ def read_state(user_dir: Path) -> dict[str, Any]:
     duplicates = sum(1 for session in cli_sessions if session["id"] in chat_ids)
     sessions.extend(session for session in cli_sessions if session["id"] not in chat_ids)
     known_ids = {session["id"] for session in sessions}
-    sessions.extend(read_copilot_cli_event_sessions(catalog, known_ids))
+    sessions.extend(read_copilot_cli_event_sessions(catalog, known_ids, snapshots))
     kept = [item for item in sessions if item.get("title") not in (None, "", "(untitled)") and item.get("credits") is not None]
     hidden_empty += len(sessions) - len(kept)
     sessions = kept
