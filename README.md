@@ -1,6 +1,6 @@
 # GitHub Copilot Session Dashboard
 
-A minimalist, offline dashboard for GitHub Copilot Chat's cached VS Code session logs. It reads only local files, no third-party dependencies.
+A minimalist, offline dashboard for GitHub Copilot Chat's cached VS Code session logs and the standalone Copilot CLI's local usage history. It reads local files read-only and has no third-party dependencies.
 
 ## Run
 
@@ -26,66 +26,52 @@ python3 copilot_dashboard.py --port 9000
 python3 copilot_dashboard.py --vscode-user-dir "/path/to/Code/User"
 ```
 
-VS Code's `User` directory is auto-detected at:
-
-- macOS: `~/Library/Application Support/Code/User`
-- Windows: `%APPDATA%\Code\User`
-- Linux: `~/.config/Code/User` (or `$XDG_CONFIG_HOME/Code/User`)
-
-(`Code - Insiders` is also checked as a fallback on every platform.)
+VS Code's `User` directory is auto-detected at `~/Library/Application Support/Code/User` on macOS, `%APPDATA%\Code\User` on Windows, and `~/.config/Code/User` (or `$XDG_CONFIG_HOME/Code/User`) on Linux. `Code - Insiders` is also checked as a fallback.
 
 ## Dashboard features
 
-- Searchable, sortable session table: title, workspace, chat mode (agent/ask/edit), model, estimated credits consumed, estimated cost, input/output token counts, model context window, generation time, session runtime, created time, and last-updated time.
-- Estimated credits consumed for the current calendar month (no plan has a locally-cached monthly limit, so this is always shown against an unbounded allotment).
-- Current-month totals: session count, tokens in, tokens out, and top models by tokens, credits, and session count.
+- Searchable, sortable session table with lifetime token totals, reported/estimated credits, current context occupancy, timings, and session timestamps.
+- Current-month cards and per-model rankings attributed from per-call timestamps in the browser's local calendar timezone. Calls without timestamps are excluded from monthly totals, rather than assigned to a session's creation month.
 - Manual refresh and optional 60-second auto-refresh.
-- Per-row share menu: **Copy JSON** copies the full session record (pretty-printed, including the estimated cost) to the clipboard, and **Download .md file** saves the session details as a Markdown file named after the title and created date.
+- Per-row **Copy JSON** and **Download .md file** exports, including metric coverage and provenance.
 
-## Where the data comes from
+## Local data sources
 
-All data is read at request time from local files GitHub Copilot already writes to disk, all read-only:
+The server reconstructs and merges these sources at request time:
 
-- **Chat session logs** — one JSONL file per chat session at `workspaceStorage/<hash>/chatSessions/<sessionId>.jsonl` (per opened folder/workspace) and `globalStorage/emptyWindowChatSessions/<sessionId>.jsonl` (windows with no folder open). Each line is an append-only operation (`{"kind": 0|1|2, "k": [...path], "v": ...}`) — `kind 0` is the session's initial full document, `kind 1` sets a value at a path, `kind 2` appends items to a list at a path. `replay_session()` replays these in order to reconstruct each session's current state (title, per-request model, token counts, timings). There is no snapshot table to query directly for these.
-- **`workspace.json`** next to each `workspaceStorage/<hash>/` folder, giving the workspace's folder path (and so its display name).
-- **The standalone GitHub Copilot CLI's own session history** — a separate product from the Chat panel above (VS Code shims it in under `globalStorage/github.copilot-chat/copilotCli/`, but it keeps its own state in `~/.copilot/session-store.db` regardless of which host launched it). Unlike the Chat panel's logs, this SQLite database's `assistant_usage_events` table records real per-request cache-read/cache-write token counts and a ready-made cost figure (`total_nano_aiu`), which `read_copilot_cli_sessions()` reads directly rather than re-estimating. These rows show up in the table with mode `cli`. This file's schema is an internal, undocumented implementation detail that can change between Copilot CLI releases, so every read of it is defensive and silently skipped if missing or unrecognized.
-- **Copilot's own locally-cached live model/pricing catalog** — `globalStorage/github.copilot-chat/debug-logs/*/models.json` (and the equivalent per-workspace path), written by the extension purely for its own debug logging. `load_live_model_pricing()` uses it, when present, to override the hardcoded per-model rates below with live ones straight from GitHub, reducing drift as prices change. Also an undocumented debug artifact, so this is best-effort and falls back silently to the hardcoded table.
+- **VS Code Chat sessions** — `workspaceStorage/<hash>/chatSessions/<sessionId>.jsonl` and `globalStorage/emptyWindowChatSessions/<sessionId>.jsonl`. The JSONL files are append-only operations; `replay_session()` rebuilds each current session document. Adjacent `workspace.json` files provide workspace names.
+- **VS Code local state** — `globalStorage/state.vscdb` provides best-effort plan/account labels only. No token or credential is read; no locally cached monthly quota is available.
+- **Copilot CLI sessions** — `~/.copilot/session-store.db`, read through SQLite's read-only mode. The dashboard selects only known session/turn/usage columns and tolerates missing optional columns, including older schemas without `cache_write_tokens` or event `created_at`.
+- **Copilot model catalog snapshots** — `globalStorage/github.copilot-chat/debug-logs/*/models.json` and equivalent workspace-storage paths. These are undocumented local debug artifacts, not a stable API. Valid snapshots are tried independently (a corrupt newest file does not mask an older valid one). Historical requests use the newest valid snapshot not newer than that request; if none is available, the dashboard does not silently apply a newer rate card. Selected-model picker prices are a fallback only for an exact matching model ID (allowing the known `copilot/` wrapper) and are marked with an unverified historical price date.
 
-The server merges all of these in `read_state()` and exposes the result as a single JSON payload at `GET /api/data`. The browser then renders everything client-side from that payload; no computation happens against a remote service, and nothing here makes a network call or reads any auth token or API key.
+The application makes no network requests, reads no credentials, and does not call GitHub billing APIs. All storage access is local and read-only. If a Chat and CLI record share the exact session ID, the CLI duplicate is excluded; different IDs are not heuristically merged.
 
-### Dashboard cards
+## Credits, prices, and coverage
 
-- **Plan card** — Plan name and account are both auto-detected from VS Code's own local state, no flags needed:
-  - `resolve_plan_name()` reads the seat SKU VS Code caches for its own feature-flagging (`extensionsAssignmentFilterProvider.copilotSku` in `globalStorage/state.vscdb`, e.g. `copilot_enterprise_seat_quota`) and turns it into a label like "Copilot Enterprise". Falls back to the generic "GitHub Copilot" if that key isn't present.
-  - `resolve_subscription_account()` reads the `github-<accountLabel>-usages` key VS Code itself keeps in the same database — only the account label, never the OAuth token, which VS Code stores separately in the OS keychain.
-  - There is no local cache of a numeric monthly quota for **any** plan tier (GitHub only serves that live from its own servers for the in-editor quota banners, never persists it to disk) — searched `state.vscdb` and the `github.copilot-chat` extension's own storage/debug logs for it and found nothing. So the credit limit is always treated as unbounded; the card shows "Unlimited" rather than guessing a number.
-  - Estimated cost is `credits consumed this month × $0.01`.
-- **Credits consumed card** — Credits are computed **entirely from local session logs**, not fetched from GitHub. For each Copilot-hosted chat/agent request (`modelId` starting with `copilot/`), the dashboard reads that request's logged `promptTokens`/`outputTokens` (from `result.metadata` in the session log) and multiplies by the resolved model's per-token rate — preferring a live rate read from Copilot's own locally-cached model catalog (`load_live_model_pricing()`) over the hardcoded table below it (`MODEL_PRICING_BY_SLUG` in `copilot_dashboard.py`, sourced from [GitHub's published model pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)), converting at 1 credit = $0.01. Requests to a bring-your-own-key model (any `modelId` not prefixed `copilot/`, e.g. a directly configured Gemini or local Ollama model) are counted as 0 credits, since GitHub does not bill those. Models found in neither pricing source fall back to a documented flat estimate (`DEFAULT_UNKNOWN_RATES`) rather than silently reading as zero. Copilot CLI sessions (mode `cli`) skip all of this and use the CLI's own already-computed cost per request instead (see below). Since the monthly allotment is always unbounded (see above), there's no progress bar to compare against — just the running total.
-- **Sessions this month card** — Computed in the browser from sessions whose `creationDate` falls in the current calendar month. Token totals sum each session's aggregated `inputTokens`/`outputTokens`.
-- **Model metrics card** — Also browser-side, over the same current-month sessions, using each session's most-recently-used model (`result.metadata.resolvedModel`, falling back to the request's `modelId`).
+GitHub's [published model-price page](https://docs.github.com/copilot/reference/copilot-billing/models-and-pricing) is in USD per million tokens, while Copilot Chat's cached `models.json` contains catalog billing prices and billing units. VS Code normalizes catalog rates using each tier's `batch_size`; this dashboard similarly normalizes cached rates to AI credits per million tokens and parses default/long-context plus input, output, cache-read, and cache-write rates. Since Chat logs do not reliably provide cache splits, estimates use default input/output rates and are marked partial when cache pricing is present. Invalid, non-finite, missing-unit, or unmatched prices are not used. The previous hand-entered `_PRICING_ROWS` and generic unknown-model rate were removed because they could drift from current prices and falsely imply precision. No rate is inferred from a model's display name.
 
-### Session table
+For **Chat sessions**, cost accounting prefers persisted per-turn `copilotCredits` (including an explicit zero). If VS Code also persists `sessionCopilotCredits`, the dashboard reconciles it with turn credits using the larger reported session amount; it does not add a session total on top of its turns. A local catalog or exact-ID picker rate can produce an estimate only when model and token inputs are available. Rate estimates are explicitly marked estimated; missing cache-read/write breakdowns or an unknown long-context threshold make them partial estimates. Bring-your-own-key model calls are not counted as GitHub Copilot credits. Without a reported amount or defensible matching rate, cost is unavailable—not zero.
 
-Each row is one chat session. Chat panel rows are reconstructed entirely from their own JSONL log; Copilot CLI rows (mode `cli`) come from `~/.copilot/session-store.db` instead (see "Where the data comes from" above):
+For **CLI sessions**, per-event `total_nano_aiu` is treated as the CLI-reported charge and converted to dashboard credits. Null/invalid event costs make the aggregate partial or unavailable. CLI cache reads and writes are retained separately; cache reads are a subset of input and are never added to IN.
 
-- **Title** — the session's `customTitle` if VS Code has generated one, else `(untitled)`. For CLI sessions, its auto-generated `summary`.
-- **Workspace** — the folder name from that workspace's `workspace.json`, or "(no workspace)" for sessions opened in a window with no folder. For CLI sessions, the trailing folder name of its recorded `cwd` (falling back to `repository`).
-- **Mode** — the most recent request's `modeInfo.kind` (`agent`, `ask`, or `edit`) for Chat panel sessions; always `cli` for Copilot CLI sessions, since it has no equivalent ask/edit distinction.
-- **Model** — the display name of the most recently used model, preferring the model catalog GitHub Copilot Chat itself caches locally (`inputState.selectedModel.metadata`, which is how the app learns model context-window sizes too) over a raw model id.
-- **Credits** / **Est. cost** — see "Credits consumed card" above; summed per-request over the session.
-- **Tokens in / out** — summed `result.metadata.promptTokens` / `outputTokens` over every request in the session.
-- **Cached** — cache-read token count, summed per session. Only populated for Copilot CLI sessions (mode `cli`), whose local database records this per request; the Chat panel's own JSONL logs never expose it, so Chat panel sessions show "—" here.
-- **Context** — the selected model's maximum input token window (a static model spec pulled from the same local model-catalog cache), not a live usage figure.
-- **Gen. time** — summed `result.timings.totalElapsed` per request (falling back to the request's top-level `elapsedMs`).
-- **Runtime** — the span from the session's first request timestamp to its last completed response; a simpler wall-clock figure than idle-gap-aware "active runtime," since Copilot's logs don't need that distinction the way a long-running background agent's do.
+**Cost and tokens are different confidence dimensions.** Some Chat logs lack `modelTotals`, which VS Code only supplies for some hosts. Where present and valid, `modelTotals` supports per-turn model input/cached/output totals. Otherwise legacy `result.metadata` values are retained as partial lifetime usage because local history may omit model, tool, or subagent calls. `Cached` is always a subset of `IN`; prompt-source breakdowns are not interpreted as cache hits. Unknown fields are null and render as `—`; a real zero remains zero. The CLI's per-event token details are more complete when the schema provides them.
 
-Sessions with no title and zero requests are hidden, and the list is sorted by last-updated time. The browser then applies your search text (matched against title, workspace, session ID, model, and mode) and column sorting on top of that list.
+## Lifetime usage versus current context
+
+- **IN / OUT / Cached** are cumulative session totals across observed model calls. Cached input is included in IN.
+- **Current context** is a separate occupancy snapshot from the last relevant persisted response's `contextUsage.currentTokens` and `tokenLimit`, or (when available) that response's `promptTokens + completionTokens`. A percentage is shown only with a persisted or verifiable configured limit. It is not a lifetime token total.
+- CLI usage events do not describe current prompt occupancy, so CLI context is unavailable rather than guessed from lifetime totals.
+
+## Monthly attribution and model rankings
+
+Monthly cards and model rankings use call/event timestamps, not session creation timestamps. Browser-local calendar month boundaries match the dashboard's existing display timezone. Calls with absent or invalid timestamps cannot be assigned to a month and are omitted; the dashboard reports that timestamp limitation. Monthly credit totals are marked incomplete when any timestamped Copilot call has unavailable charges, and known subtotals are not presented as complete totals. Model metrics are based on observed request-model attribution; per-call reported credits may not be divisible among multiple models used within a single turn.
+
+The plan and account labels are best-effort values from VS Code's local state database. No local monthly quota is available, so the dashboard does not claim to show an authoritative account-wide balance. Local session history also excludes activity on other devices and products.
 
 ## Privacy and limitations
 
-- The server binds to `localhost` by default and serves no external assets. It makes no network calls at all.
-- Nothing here reads, decodes, or transmits any GitHub token, API key, or other credential. It only reads the same local session-metadata files VS Code's Copilot Chat UI and the Copilot CLI already read/write themselves.
-- **Chat panel credits are a local estimate, not your account's authoritative usage.** Unlike some agent tools that cache a server-confirmed usage total locally, GitHub Copilot does not persist your account's real-time credit balance anywhere on disk that VS Code can read. This dashboard reconstructs an estimate purely from the token counts your own local chat logs already record, preferring a live per-model rate read from Copilot's own local pricing cache when available and otherwise falling back to a hardcoded table that can drift from GitHub's real rates over time. **Copilot CLI session credits are not an estimate** — they're the exact cost the CLI itself already computed and logged per request, read as-is.
-- Long-context pricing tiers for a given Chat panel request are not distinguished locally (VS Code's logs don't record which pricing tier a request landed in), so all Chat panel requests to a model price at that model's "default" tier rate, even though the live pricing cache (when present) does carry a separate `long_context` rate.
-- Session conversation transcripts, tool-call details, and file contents are not surfaced by this dashboard — only metadata and aggregate counts.
-- Cached values can lag behind what VS Code has written most recently; the page displays the local data timestamp.
+- The server binds to `localhost` by default and serves no external assets.
+- VS Code and CLI storage schemas are private implementation details and may change. Unavailable or malformed fields degrade to partial/unavailable values.
+- Catalog rates are estimates rather than server-confirmed billed amounts and may differ because of billing adjustments, cache accounting, long-context rules, or historical pricing changes.
+- Session transcripts, tool-call details, and file contents are not surfaced; only metadata and aggregate counts are used.
+- Local files can lag behind the latest editor state; the page includes the data generation time.

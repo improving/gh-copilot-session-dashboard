@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-import re
 import sqlite3
 import sys
 import threading
@@ -24,68 +24,31 @@ APP_TITLE = "GitHub Copilot Session Dashboard"
 
 FALLBACK_PLAN_NAME = "GitHub Copilot"
 
-# Per-1M-token USD rates published at
-# https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing
-_PRICING_ROWS: list[tuple[str, float, float, float]] = [
-    ("GPT-5 mini", 0.25, 0.025, 2.00),
-    ("GPT-5.3-Codex", 1.75, 0.175, 14.00),
-    ("GPT-5.4", 2.50, 0.25, 15.00),
-    ("GPT-5.4 (long context)", 5.00, 0.50, 22.50),
-    ("GPT-5.4 mini", 0.75, 0.075, 4.50),
-    ("GPT-5.4 nano", 0.20, 0.02, 1.25),
-    ("GPT-5.5", 5.00, 0.50, 30.00),
-    ("GPT-5.5 (long context)", 10.00, 1.00, 45.00),
-    ("GPT-5.6 Luna", 0.20, 0.02, 1.20),
-    ("GPT-5.6 Luna (long context)", 0.40, 0.04, 1.80),
-    ("GPT-5.6 Sol", 4.00, 0.40, 20.00),
-    ("GPT-5.6 Sol (long context)", 8.00, 0.80, 30.00),
-    ("GPT-5.6 Terra", 2.00, 0.20, 12.00),
-    ("GPT-5.6 Terra (long context)", 4.00, 0.40, 18.00),
-    ("GPT-6 Astra", 10.00, 1.00, 50.00),
-    ("GPT-6 Astra (long context)", 20.00, 2.00, 75.00),
-    ("GPT-6 Luna", 0.10, 0.01, 0.50),
-    ("GPT-6 Luna (long context)", 0.20, 0.02, 0.75),
-    ("GPT-6 Sol", 2.00, 0.20, 10.00),
-    ("GPT-6 Sol (long context)", 4.00, 0.40, 15.00),
-    ("Claude Haiku 4.5", 1.00, 0.10, 5.00),
-    ("Claude Sonnet 4", 3.00, 0.30, 15.00),
-    ("Claude Sonnet 4.6", 3.00, 0.30, 15.00),
-    ("Claude Opus 4.7", 5.00, 0.50, 25.00),
-    ("Claude Opus 4.8", 5.00, 0.50, 25.00),
-    ("Claude Opus 4.8 (fast mode)", 10.00, 1.00, 50.00),
-    ("Claude Opus 5", 5.00, 0.50, 25.00),
-    ("Claude Opus 5.5", 4.00, 0.20, 20.00),
-    ("Claude Sonnet 5", 2.00, 0.20, 10.00),
-    ("Claude Fable 5", 10.00, 1.00, 50.00),
-    ("Claude Fable 5.1", 10.00, 0.25, 50.00),
-    ("Gemini 3.5 Flash", 1.50, 0.15, 9.00),
-    ("Gemini 3.6 Flash", 0.75, 0.075, 3.75),
-    ("Gemini 3.7 Flash", 0.75, 0.075, 3.75),
-    ("Gemini 3.8 Flash", 0.75, 0.075, 3.75),
-    ("MAI-Code-1.1-Flash", 0.20, 0.02, 1.20),
-    ("Grok 4.5", 2.00, 0.50, 6.00),
-    ("Grok 4.6", 2.00, 0.50, 6.00),
-    ("Grok 4.7", 2.00, 0.50, 6.00),
-    ("Grok 4.5 (long context)", 4.00, 1.00, 12.00),
-    ("Grok 4.6 (long context)", 4.00, 1.00, 12.00),
-    ("Grok 4.7 (long context)", 4.00, 1.00, 12.00),
-    ("Kimi K2.7 Code", 0.95, 0.19, 4.00),
-    ("Kimi K3", 3.00, 0.30, 15.00),
-]
+# Dashboard theme colors — tweak these to restyle the UI.
+THEME = {
+    "bg": "#0e1116",              # page background
+    "fg": "white",             # primary text
+    "muted": "#9198a1",        # secondary text, labels, icons
+    "accent": "#238636",       # panel border & badge highlight
+    "card-bg": "#161b22",      # cards and popup menus
+    "control-bg": "#22282f",   # buttons, inputs, tooltip
+    "control-hover": "#202329",
+    "border": "#d5d9e0",       # button/menu outlines
+    "table-border": "#2a2c2a", # row separators
+    "row-hover": "#202329",
+    "badge-fg": "white",       # text on accent badges
+    "card-shadow": "#00000008",
+    "popup-shadow": "#00000033",
+    "menu-shadow": "#0000001f",
+    "error-fg": "#a12727",
+    "error-bg": "#fff0f0",
+    "error-border": "#f2c8c8",
+}
 
-DEFAULT_UNKNOWN_RATES = {"input": 3.0, "cached_input": 0.3, "output": 15.0}
-
+THEME_VARS_CSS = ";".join(f"--{name}:{value}" for name, value in THEME.items())
 
 def _slug(value: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", value.lower())
-
-
-MODEL_PRICING_BY_SLUG: dict[str, dict[str, float]] = {}
-MODEL_PRICING_DISPLAY: dict[str, str] = {}
-for _name, _in, _cached, _out in _PRICING_ROWS:
-    _key = _slug(_name)
-    MODEL_PRICING_BY_SLUG[_key] = {"input": _in, "cached_input": _cached, "output": _out}
-    MODEL_PRICING_DISPLAY[_key] = _name
+    return value.strip().lower()
 
 
 def candidate_vscode_user_dirs() -> list[Path]:
@@ -336,23 +299,55 @@ def replay_session(path: Path) -> dict | None:
     return root if isinstance(root, dict) else None
 
 
+def _valid_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None
+    return int(value)
+
+
+def _valid_rate(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    try:
+        rate = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return rate if math.isfinite(rate) else None
+
+
 def harvest_model_catalog(doc: dict, catalog: dict[str, dict[str, Any]]) -> None:
-    """Opportunistically learn model display names / context windows from a session's selected-model cache."""
     input_state = doc.get("inputState")
     selected = input_state.get("selectedModel") if isinstance(input_state, dict) else None
     meta = selected.get("metadata") if isinstance(selected, dict) else None
-    if not isinstance(meta, dict):
+    if not isinstance(meta, dict) or not isinstance(meta.get("id"), str):
         return
-    model_id = meta.get("id")
-    if not model_id:
-        return
-    entry = catalog.setdefault(_slug(str(model_id)), {})
-    name = meta.get("name")
-    if isinstance(name, str) and name:
-        entry["name"] = name
-    max_input = meta.get("maxInputTokens")
-    if isinstance(max_input, (int, float)):
-        entry["maxInputTokens"] = int(max_input)
+    entry = catalog.setdefault(_slug(meta["id"]), {})
+    if isinstance(meta.get("name"), str) and meta["name"]:
+        entry["name"] = meta["name"]
+    for key in ("maxInputTokens", "contextWindow", "contextSize"):
+        count = _valid_count(meta.get(key))
+        if count:
+            entry["selectedContextTokens"] = count
+            break
+    prices = meta.get("billing") or meta.get("token_prices") or meta.get("tokenPrices")
+    if isinstance(prices, dict):
+        token_prices = prices.get("token_prices") if isinstance(prices.get("token_prices"), dict) else prices
+        normalized = _normalize_token_prices(token_prices, prices.get("batch_size"))
+        if not normalized:
+            tier = token_prices.get("default") if isinstance(token_prices.get("default"), dict) else token_prices
+            direct = {}
+            for target, keys in {"input": ("inputPrice", "input_price"), "output": ("outputPrice", "output_price"),
+                                 "cacheRead": ("cacheReadPrice", "cache_read_price", "cache_price"),
+                                 "cacheWrite": ("cacheWritePrice", "cache_write_price")}.items():
+                value = next((_valid_rate(tier.get(key)) for key in keys if _valid_rate(tier.get(key)) is not None), None)
+                if value is not None:
+                    direct[target] = value
+            if "input" in direct and "output" in direct:
+                normalized = {"default": direct}
+        if normalized:
+            entry["pickerPricing"] = normalized
 
 
 def _iter_models_json_paths(user_dir: Path) -> list[Path]:
@@ -372,67 +367,112 @@ def _iter_models_json_paths(user_dir: Path) -> list[Path]:
     return paths
 
 
-def load_live_model_pricing(user_dir: Path) -> None:
-    """Best-effort refresh of MODEL_PRICING_BY_SLUG/DISPLAY from Copilot's own locally-cached,
-    live-fetched model catalog, in preference to the hardcoded table above (which only reflects
-    GitHub's published rates as of whenever this file was last edited).
+def _normalize_price_tier(tier: dict[str, Any]) -> dict[str, float] | None:
+    batch_size = _valid_count(tier.get("batch_size"))
+    if not batch_size:
+        return None
+    normalized: dict[str, float] = {}
+    for key, aliases in {
+        "input": ("input_price",),
+        "output": ("output_price",),
+        "cacheRead": ("cache_read_price", "cache_price"),
+        "cacheWrite": ("cache_write_price",),
+    }.items():
+        raw = next((tier.get(alias) for alias in aliases if tier.get(alias) is not None), None)
+        rate = _valid_rate(raw)
+        if rate is not None:
+            normalized[key] = rate * 1_000_000 / batch_size
+    threshold = next((_valid_count(tier.get(key)) for key in ("threshold_tokens", "threshold", "max_prompt_tokens")
+                      if _valid_count(tier.get(key)) is not None), None)
+    if threshold is not None:
+        normalized["thresholdTokens"] = threshold
+    return normalized if "input" in normalized and "output" in normalized else None
 
-    Silently no-ops if no cache is found or it can't be parsed as expected; this file's
-    presence/location/schema is an internal debug artifact of the extension, not a stable format.
-    """
-    paths = _iter_models_json_paths(user_dir)
-    if not paths:
-        return
-    latest = max(paths, key=lambda p: p.stat().st_mtime)
-    try:
-        models = json.loads(latest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if not isinstance(models, list):
-        return
-    for model in models:
-        if not isinstance(model, dict):
+
+def _normalize_token_prices(token_prices: dict[str, Any], inherited_batch_size: Any = None) -> dict[str, Any] | None:
+    batch_size = _valid_count(token_prices.get("batch_size", inherited_batch_size))
+    default = token_prices.get("default")
+    default = dict(default) if isinstance(default, dict) else dict(token_prices)
+    if batch_size is not None:
+        default.setdefault("batch_size", batch_size)
+    default_rates = _normalize_price_tier(default)
+    if not default_rates:
+        return None
+    result: dict[str, Any] = {"default": default_rates}
+    long_context = token_prices.get("long_context")
+    if isinstance(long_context, dict):
+        long_context = dict(long_context)
+        if batch_size is not None:
+            long_context.setdefault("batch_size", batch_size)
+        long_rates = _normalize_price_tier(long_context)
+        if long_rates:
+            result["longContext"] = long_rates
+    threshold = next((_valid_count(token_prices.get(key)) for key in ("long_context_threshold", "threshold_tokens")
+                      if _valid_count(token_prices.get(key)) is not None), None)
+    if threshold is not None and "longContext" in result:
+        result["longContext"].setdefault("thresholdTokens", threshold)
+    return result
+
+
+def load_live_model_pricing(user_dir: Path) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    for path in _iter_models_json_paths(user_dir):
+        try:
+            captured = path.stat().st_mtime
+            models = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             continue
-        model_id = model.get("id")
-        if not isinstance(model_id, str) or not model_id:
+        if not isinstance(models, list):
             continue
-        billing = model.get("billing") if isinstance(model.get("billing"), dict) else {}
-        token_prices = billing.get("token_prices") if isinstance(billing.get("token_prices"), dict) else {}
-        default_prices = token_prices.get("default") if isinstance(token_prices.get("default"), dict) else {}
-        input_price = default_prices.get("input_price")
-        output_price = default_prices.get("output_price")
-        cache_read_price = default_prices.get("cache_read_price")
-        if not isinstance(input_price, (int, float)) or not isinstance(output_price, (int, float)):
-            continue
-        if input_price == 0 and output_price == 0:
-            continue  # a free/retired/embedding entry, not a priced chat model worth overriding with
-        slug = _slug(model_id)
-        MODEL_PRICING_BY_SLUG[slug] = {
-            "input": input_price / 100,
-            "cached_input": (cache_read_price / 100) if isinstance(cache_read_price, (int, float)) else 0.0,
-            "output": output_price / 100,
-        }
-        name = model.get("name")
-        if isinstance(name, str) and name:
-            MODEL_PRICING_DISPLAY[slug] = name
+        entries: dict[str, dict[str, Any]] = {}
+        for model in models:
+            if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+                continue
+            model_id = model["id"]
+            billing = model.get("billing") if isinstance(model.get("billing"), dict) else {}
+            token_prices = billing.get("token_prices")
+            prices = _normalize_token_prices(token_prices, billing.get("batch_size")) if isinstance(token_prices, dict) else None
+            long_threshold = _valid_count(model.get("long_context_threshold"))
+            if prices and prices.get("longContext") and long_threshold is not None:
+                prices["longContext"].setdefault("thresholdTokens", long_threshold)
+            item: dict[str, Any] = {"id": model_id}
+            if isinstance(model.get("name"), str):
+                item["name"] = model["name"]
+            if prices:
+                item["prices"] = prices
+            for key in ("max_prompt_tokens", "context_max"):
+                count = _valid_count(model.get(key))
+                if count:
+                    item["maxInputTokens"] = count
+                    break
+            entries[_slug(model_id)] = item
+        if entries:
+            snapshots.append({"path": str(path), "capturedAt": captured, "models": entries})
+    return sorted(snapshots, key=lambda item: item["capturedAt"])
 
 
-def lookup_pricing(pricing_key: str | None) -> dict[str, float]:
-    if pricing_key:
-        rates = MODEL_PRICING_BY_SLUG.get(_slug(str(pricing_key)))
-        if rates:
-            return rates
-    return DEFAULT_UNKNOWN_RATES
-
-
-def estimate_credits(prompt_tokens: Any, output_tokens: Any, pricing_key: str | None, vendor: str) -> float:
-    if vendor and vendor != "copilot":
-        return 0.0  # bring-your-own-key model: billed by that provider directly, not GitHub credits
-    p = prompt_tokens if isinstance(prompt_tokens, (int, float)) else 0
-    o = output_tokens if isinstance(output_tokens, (int, float)) else 0
-    rates = lookup_pricing(pricing_key)
-    cost_usd = (p * rates["input"] + o * rates["output"]) / 1_000_000
-    return cost_usd / CREDIT_USD_RATE
+def lookup_pricing(pricing_key: str | None, snapshots: list[dict[str, Any]], timestamp: float | None,
+                   picker_catalog: dict[str, dict[str, Any]]) -> tuple[dict[str, Any] | None, str | None]:
+    if not pricing_key:
+        return None, None
+    keys = [_slug(pricing_key)]
+    if pricing_key.startswith("copilot/"):
+        keys.append(_slug(pricing_key.split("/", 1)[1]))
+    eligible = [item for item in snapshots if timestamp is None or item["capturedAt"] <= timestamp]
+    for snapshot in reversed(eligible):
+        for key in keys:
+            model = snapshot["models"].get(key)
+            if model and model.get("prices"):
+                if timestamp is None:
+                    source = f"local catalog ({Path(snapshot['path']).name}; request timestamp unavailable)"
+                else:
+                    age = max(0, int(timestamp - snapshot["capturedAt"]))
+                    source = f"local catalog ({Path(snapshot['path']).name}; {age // 86400}d old)"
+                return model["prices"], source
+    entry = next((picker_catalog.get(key) for key in keys if picker_catalog.get(key, {}).get("pickerPricing")), None)
+    if entry:
+        return entry["pickerPricing"], "selected-model picker snapshot (historical price unverified)"
+    return None, None
 
 
 def display_model_name(model_id: str | None, catalog: dict[str, dict[str, Any]]) -> str:
@@ -440,10 +480,10 @@ def display_model_name(model_id: str | None, catalog: dict[str, dict[str, Any]])
         return "—"
     slug = _slug(str(model_id))
     entry = catalog.get(slug)
+    if entry is None and str(model_id).startswith("copilot/"):
+        entry = catalog.get(_slug(str(model_id).split("/", 1)[1]))
     if entry and entry.get("name"):
         return str(entry["name"])
-    if slug in MODEL_PRICING_DISPLAY:
-        return MODEL_PRICING_DISPLAY[slug]
     name = str(model_id)
     if name.startswith("models/"):
         name = name[len("models/"):]
@@ -456,11 +496,14 @@ def model_context_window(model_id: str | None, catalog: dict[str, dict[str, Any]
     if not model_id:
         return None
     entry = catalog.get(_slug(str(model_id)))
+    if entry is None and str(model_id).startswith("copilot/"):
+        entry = catalog.get(_slug(str(model_id).split("/", 1)[1]))
     return entry.get("maxInputTokens") if entry else None
 
 
 def iso_from_epoch_ms(value: Any) -> str | None:
-    if not isinstance(value, (int, float)):
+    value = _valid_rate(value)
+    if value is None:
         return None
     try:
         return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat()
@@ -468,101 +511,292 @@ def iso_from_epoch_ms(value: Any) -> str | None:
         return None
 
 
-def extract_session(doc: dict, workspace: str, catalog: dict[str, dict[str, Any]], fallback_id: str) -> dict[str, Any] | None:
-    session_id = str(doc.get("sessionId") or fallback_id)
-    requests = doc.get("requests")
-    requests = requests if isinstance(requests, list) else []
+def _reported_value(objects: list[dict[str, Any]], key: str) -> Any:
+    for obj in objects:
+        if key in obj:
+            return obj[key]
+    return None
 
+
+def _response_totals(req: dict[str, Any], result: dict[str, Any], meta: dict[str, Any]) -> list[dict[str, Any]] | None:
+    raw = next((obj.get("modelTotals") for obj in (result, meta, req) if isinstance(obj.get("modelTotals"), (dict, list))), None)
+    if raw is None:
+        return None
+    entries = raw if isinstance(raw, list) else list(raw.values()) if all(isinstance(v, dict) for v in raw.values()) else [raw]
+    totals: list[dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        input_count = _valid_count(item.get("inputTokens", item.get("input")))
+        cached_count = _valid_count(item.get("cachedInputTokens", item.get("cachedTokens", item.get("cacheReadTokens"))))
+        output_count = _valid_count(item.get("outputTokens", item.get("output")))
+        model = item.get("modelId", item.get("model"))
+        if input_count is not None or output_count is not None or cached_count is not None:
+            totals.append({"model": model if isinstance(model, str) else None, "input": input_count,
+                           "cached": cached_count, "output": output_count})
+    return totals
+
+
+def _context_usage(req: dict[str, Any], result: dict[str, Any], meta: dict[str, Any]) -> dict[str, Any] | None:
+    objects = [result, meta, req]
+    context = next((obj.get("contextUsage") for obj in objects if isinstance(obj.get("contextUsage"), dict)), None)
+    if isinstance(context, dict):
+        current = _valid_count(context.get("currentTokens"))
+        limit = _valid_count(context.get("tokenLimit"))
+        if current is not None:
+            return {"currentTokens": current, "tokenLimit": limit or None,
+                    "percent": round(current * 100 / limit, 1) if limit else None, "source": "persisted context usage"}
+    response = result.get("response") if isinstance(result.get("response"), dict) else {}
+    response_objects = [result, response, req]
+    prompt = next((_valid_count(obj.get("promptTokens")) for obj in response_objects
+                   if _valid_count(obj.get("promptTokens")) is not None), None)
+    completion = next((_valid_count(obj.get("completionTokens")) for obj in response_objects
+                       if _valid_count(obj.get("completionTokens")) is not None), None)
+    if prompt is None or completion is None:
+        return None
+    return {"currentTokens": prompt + completion, "tokenLimit": None, "percent": None,
+            "source": "persisted response token counts"}
+
+
+def _estimate_request_credits(input_tokens: int | None, output_tokens: int | None, model_id: str | None,
+                              request_time: float | None, snapshots: list[dict[str, Any]],
+                              catalog: dict[str, dict[str, Any]], vendor: str) -> tuple[float | None, str, str | None]:
+    if vendor and vendor != "copilot":
+        return None, "byok", None
+    if not model_id or input_tokens is None or output_tokens is None:
+        return None, "unavailable", None
+    prices, source = lookup_pricing(model_id, snapshots, request_time, catalog)
+    if not prices:
+        return None, "unavailable", None
+    rates = prices.get("default", prices)
+    assumptions = []
+    if source and "historical price unverified" in source:
+        assumptions.append("historical picker price unverified")
+    if source and "request timestamp unavailable" in source:
+        assumptions.append("request timestamp unavailable")
+    long_rates = prices.get("longContext")
+    if isinstance(long_rates, dict):
+        threshold = _valid_count(long_rates.get("thresholdTokens"))
+        if threshold is not None and input_tokens > threshold:
+            rates = long_rates
+            source = (source or "catalog") + " (long-context tier)"
+        elif threshold is None:
+            assumptions.append("long-context threshold unknown")
+    in_rate, out_rate = _valid_rate(rates.get("input")), _valid_rate(rates.get("output"))
+    if in_rate is None or out_rate is None:
+        return None, "unavailable", source
+    credits = (input_tokens * in_rate + output_tokens * out_rate) / 1_000_000
+    if any(key in tier for tier in (prices.get("default", prices), long_rates or {})
+           for key in ("cacheRead", "cacheWrite")):
+        assumptions.append("cache split unavailable")
+    quality = "estimated-partial" if assumptions else "estimated"
+    return credits, quality, source + ("; " + ", ".join(assumptions) if assumptions else "")
+
+
+def extract_session(doc: dict, workspace: str, catalog: dict[str, dict[str, Any]], fallback_id: str,
+                    snapshots: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    session_id = str(doc.get("sessionId") or fallback_id)
+    requests = doc.get("requests") if isinstance(doc.get("requests"), list) else []
+    requests = [req for req in requests if isinstance(req, dict)]
     custom_title = doc.get("customTitle")
     title = custom_title.strip() if isinstance(custom_title, str) and custom_title.strip() else "(untitled)"
     if title == "(untitled)" and not requests:
-        return None  # hidden empty: no title, no messages
+        return None
 
-    credits = 0.0
-    input_tokens = 0
-    output_tokens = 0
+    snapshots = snapshots or []
+    picker_catalog: dict[str, dict[str, Any]] = {}
+    harvest_model_catalog(doc, picker_catalog)
+    totals = {"input": 0, "output": 0, "cached": 0}
+    seen = {"input": 0, "output": 0, "cached": 0}
+    complete_model_totals = bool(requests)
+    input_complete = output_complete = cached_complete = bool(requests)
+    credits_reported = 0.0
+    credits_estimated = 0.0
+    billable_calls = byok_calls = 0
+    any_estimate = False
+    any_partial = False
+    all_costed = True
+    session_credit_reports: list[float] = []
+    call_rows: list[dict[str, Any]] = []
     gen_ms = 0.0
+    gen_count = 0
     timestamps: list[float] = []
     completed_ats: list[float] = []
     modes: list[str] = []
-    last_model_for_display: str | None = None
+    latest_context: tuple[float, dict[str, Any]] | None = None
+    last_model: str | None = None
 
     for req in requests:
-        if not isinstance(req, dict):
-            continue
-        timestamp = req.get("timestamp")
-        if isinstance(timestamp, (int, float)):
+        timestamp = _valid_rate(req.get("timestamp"))
+        if timestamp is not None:
             timestamps.append(timestamp)
-        model_id = req.get("modelId") if isinstance(req.get("modelId"), str) else None
         mode_info = req.get("modeInfo")
         if isinstance(mode_info, dict) and isinstance(mode_info.get("kind"), str):
             modes.append(mode_info["kind"])
         result = req.get("result") if isinstance(req.get("result"), dict) else {}
         meta = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-        prompt_tokens = meta.get("promptTokens")
-        out_tokens = meta.get("outputTokens")
-        resolved_model = meta.get("resolvedModel") if isinstance(meta.get("resolvedModel"), str) else None
-        if isinstance(prompt_tokens, (int, float)):
-            input_tokens += prompt_tokens
-        if isinstance(out_tokens, (int, float)):
-            output_tokens += out_tokens
+        model_id = req.get("modelId") if isinstance(req.get("modelId"), str) else None
+        resolved = meta.get("resolvedModel") if isinstance(meta.get("resolvedModel"), str) else None
+        pricing_model = resolved or (model_id.split("/", 1)[-1] if model_id else None)
+        display_model = resolved or model_id
+        if display_model:
+            last_model = display_model
+        model_totals = _response_totals(req, result, meta)
+        if model_totals is None:
+            complete_model_totals = False
+            in_count = _valid_count(meta.get("promptTokens"))
+            out_count = _valid_count(meta.get("outputTokens"))
+            per_models = [{"model": display_model, "input": in_count, "cached": None, "output": out_count}]
+        else:
+            per_models = model_totals
+        for item in per_models:
+            if item["cached"] is not None and (item["input"] is None or item["cached"] > item["input"]):
+                item["cached"] = None
+        req_input = req_output = 0
+        req_input_seen = req_output_seen = False
+        req_cached = 0
+        req_cached_seen = True
+        for item in per_models:
+            for total_key, value_key in (("input", "input"), ("output", "output"), ("cached", "cached")):
+                value = item[value_key]
+                if value is None:
+                    if value_key == "cached":
+                        req_cached_seen = False
+                    continue
+                totals[total_key] += value
+                seen[total_key] += 1
+                if value_key == "input":
+                    req_input += value
+                    req_input_seen = True
+                elif value_key == "output":
+                    req_output += value
+                    req_output_seen = True
+                else:
+                    req_cached += value
+        req_cached_seen = req_cached_seen and bool(per_models)
+        if not per_models or any(item["input"] is None for item in per_models):
+            input_complete = False
+        if not per_models or any(item["output"] is None for item in per_models):
+            output_complete = False
+        if not per_models or any(item["cached"] is None for item in per_models):
+            cached_complete = False
+        billed_objects = [result, meta, req]
+        reported = _valid_rate(_reported_value(billed_objects, "copilotCredits"))
+        session_report = _valid_rate(_reported_value(billed_objects, "sessionCopilotCredits"))
+        if session_report is not None:
+            session_credit_reports.append(session_report)
+        vendor = model_id.split("/", 1)[0] if model_id and "/" in model_id else ("copilot" if model_id else "")
+        if vendor and vendor != "copilot" and reported is None:
+            byok_calls += 1
+        else:
+            billable_calls += 1
+        if reported is not None:
+            call_credits, cost_quality, price_source = reported, "reported", "VS Code reported per-turn credits"
+            credits_reported += reported
+        else:
+            call_credits, cost_quality, price_source = _estimate_request_credits(
+                req_input if req_input_seen else None, req_output if req_output_seen else None,
+                pricing_model, timestamp / 1000 if timestamp is not None else None, snapshots, picker_catalog, vendor)
+            if cost_quality.startswith("estimated") and call_credits is not None:
+                credits_estimated += call_credits
+                any_estimate = True
+                any_partial = any_partial or cost_quality == "estimated-partial"
+            elif cost_quality != "byok":
+                all_costed = False
+        breakdown = [{"model": display_model_name(item.get("model") or display_model, catalog),
+                      "inputTokens": item["input"], "outputTokens": item["output"]} for item in per_models]
+        approximate = bool(model_totals and len(model_totals) > 1 and any(not item.get("model") for item in model_totals))
+        call_rows.append({"timestamp": iso_from_epoch_ms(timestamp),
+                          "model": display_model_name(display_model, catalog),
+                          "inputTokens": req_input if req_input_seen else None,
+                          "outputTokens": req_output if req_output_seen else None,
+                          "cachedTokens": req_cached if req_cached_seen else None,
+                          "credits": call_credits, "creditsQuality": cost_quality, "priceSource": price_source,
+                          "modelAttribution": "approximate" if approximate else "observed", "modelBreakdown": breakdown})
         timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
-        total_elapsed = timings.get("totalElapsed")
-        if not isinstance(total_elapsed, (int, float)):
-            total_elapsed = req.get("elapsedMs")
-        if isinstance(total_elapsed, (int, float)):
-            gen_ms += total_elapsed
+        elapsed = _valid_rate(timings.get("totalElapsed"))
+        if elapsed is None:
+            elapsed = _valid_rate(req.get("elapsedMs"))
+        if elapsed is not None:
+            gen_ms += elapsed
+            gen_count += 1
         model_state = req.get("modelState")
         if isinstance(model_state, dict):
-            completed_at = model_state.get("completedAt")
-            if isinstance(completed_at, (int, float)):
-                completed_ats.append(completed_at)
-        vendor = model_id.split("/", 1)[0] if model_id else ""
-        if resolved_model:
-            pricing_key = resolved_model
-            last_model_for_display = resolved_model
-        elif model_id:
-            pricing_key = model_id.rsplit("/", 1)[-1]
-            last_model_for_display = last_model_for_display or model_id
-        else:
-            pricing_key = None
-        credits += estimate_credits(prompt_tokens, out_tokens, pricing_key, vendor)
+            completed = _valid_rate(model_state.get("completedAt"))
+            if completed is not None:
+                completed_ats.append(completed)
+        context = _context_usage(req, result, meta)
+        if context:
+            latest_context = (timestamp or 0, context)
 
-    created_at = doc.get("creationDate")
-    if completed_ats:
-        updated_at = max(completed_ats)
-    elif timestamps:
-        updated_at = max(timestamps)
+    document_credit = _valid_rate(doc.get("sessionCopilotCredits"))
+    if document_credit is not None:
+        session_credit_reports.append(document_credit)
+    all_session_reports = max(session_credit_reports) if session_credit_reports else None
+    turn_cost = credits_reported if not any_estimate else None
+    if all_session_reports is not None:
+        credits = max(credits_reported, all_session_reports)
+        credits_quality = "reported/reconciled"
+    elif not billable_calls and byok_calls:
+        credits, credits_quality = None, "byok"
+    elif turn_cost is not None and all_costed:
+        credits, credits_quality = turn_cost, "reported"
+    elif any_estimate:
+        credits = credits_reported + credits_estimated
+        credits_quality = "partial" if any_partial or not all_costed or credits_reported else "estimated"
+    elif credits_reported:
+        credits, credits_quality = credits_reported, "partial"
+    elif not requests:
+        credits, credits_quality = None, "unavailable"
     else:
-        updated_at = created_at
+        credits, credits_quality = None, "unavailable"
 
-    runtime_ms = None
-    if timestamps:
-        end = max(completed_ats) if completed_ats else max(timestamps)
-        runtime_ms = end - min(timestamps)
-
+    if all_session_reports is not None:
+        credits_source = "VS Code sessionCopilotCredits reconciled with turn credits"
+    elif credits_quality == "reported":
+        credits_source = "VS Code per-turn copilotCredits"
+    elif credits_quality in ("estimated", "partial"):
+        credits_source = "Per-turn credits and local catalog estimates"
+    elif credits_quality == "byok":
+        credits_source = "Bring-your-own-key calls; no GitHub Copilot charge"
+    else:
+        credits_source = "No reported credits or matched local rate"
+    created_at = doc.get("creationDate")
+    updated_at = max(completed_ats) if completed_ats else max(timestamps, default=created_at)
+    runtime_ms = max(completed_ats or timestamps) - min(timestamps) if timestamps else None
+    if runtime_ms is not None and runtime_ms < 0:
+        runtime_ms = None
     mode = modes[-1] if modes else None
     if not mode:
         input_state = doc.get("inputState")
         selected_mode = input_state.get("mode") if isinstance(input_state, dict) else None
         mode = selected_mode.get("kind") if isinstance(selected_mode, dict) else None
-
+    token_quality = "exact" if complete_model_totals and input_complete and output_complete else "partial"
+    cached = totals["cached"] if cached_complete else None
+    context = latest_context[1] if latest_context else None
+    if context and not context.get("tokenLimit"):
+        context_keys = [_slug(last_model)] if last_model else []
+        if last_model and last_model.startswith("copilot/"):
+            context_keys.append(_slug(last_model.split("/", 1)[1]))
+        selected_entry = next((picker_catalog[key] for key in context_keys if key in picker_catalog), {})
+        limit = _valid_count(selected_entry.get("selectedContextTokens")) or model_context_window(last_model, catalog)
+        if limit:
+            context["tokenLimit"] = limit
+            context["percent"] = round(context["currentTokens"] * 100 / limit, 1)
+            context["source"] += "; configured model context limit"
     return {
-        "id": session_id,
-        "title": title,
-        "workspace": workspace,
-        "mode": mode or "—",
-        "model": display_model_name(last_model_for_display, catalog),
-        "messages": len(requests),
-        "credits": round(credits, 4),
-        "inputTokens": input_tokens or None,
-        "outputTokens": output_tokens or None,
-        "cachedTokens": None,  # not exposed anywhere in the Chat panel's own logs (see read_copilot_cli_sessions)
-        "contextWindow": model_context_window(last_model_for_display, catalog),
-        "genMs": gen_ms or None,
-        "runtimeMs": runtime_ms,
-        "createdAt": iso_from_epoch_ms(created_at),
-        "updatedAt": iso_from_epoch_ms(updated_at),
+        "id": session_id, "title": title, "workspace": workspace, "mode": mode or "—",
+        "model": display_model_name(last_model, catalog), "messages": len(requests),
+        "credits": round(credits, 6) if credits is not None else None, "creditsQuality": credits_quality,
+        "creditsSource": credits_source,
+        "inputTokens": totals["input"] if seen["input"] else None, "outputTokens": totals["output"] if seen["output"] else None,
+        "cachedTokens": cached, "cacheWriteTokens": None, "tokenQuality": token_quality, "contextUsage": context,
+        "contextWindow": context.get("tokenLimit") if context else None,
+        "currentContextTokens": context.get("currentTokens") if context else None,
+        "genMs": gen_ms if gen_count else None, "runtimeMs": runtime_ms, "createdAt": iso_from_epoch_ms(created_at),
+        "updatedAt": iso_from_epoch_ms(updated_at), "activity": call_rows,
+        "untimestampedCalls": sum(1 for call in call_rows if call["timestamp"] is None),
+        "priceSources": sorted({call["priceSource"] for call in call_rows if call.get("priceSource")}),
     }
 
 
@@ -571,109 +805,123 @@ def _cli_iso(value: Any) -> str | None:
     so datetime.fromisoformat() (used by _sort_key and here) parses them on Python < 3.11 too."""
     if not isinstance(value, str) or not value:
         return None
-    return value[:-1] + "+00:00" if value.endswith("Z") else value
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return normalized
 
 
 def read_copilot_cli_sessions(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    """Best-effort read of the standalone GitHub Copilot CLI's own session history.
-
-    This is a different product from the Copilot Chat panel sessions above (see
-    resolve_copilot_cli_dir()), but its local SQLite store records something the panel's own
-    JSONL logs never do: per-request cache_read/cache_write token counts and a ready-made cost
-    figure per request (`total_nano_aiu`). 1 credit = 1_000_000_000 nano-AIU here, which lines up
-    exactly with this dashboard's existing 1 credit = $0.01 (verified against the model catalog's
-    own published per-token rates), so this is used as-is instead of re-estimating it. Schema is
-    undocumented and can change between Copilot CLI releases, so every read here is defensive.
-    """
     conn = _open_ro_sqlite(resolve_copilot_cli_dir() / "session-store.db")
     if conn is None:
         return []
     try:
-        session_rows = conn.execute(
-            "SELECT id, cwd, repository, summary, created_at, updated_at FROM sessions"
-        ).fetchall()
-        turn_rows = conn.execute("SELECT session_id, timestamp FROM turns").fetchall()
-        usage_rows = conn.execute(
-            "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, "
-            "duration_ms, total_nano_aiu FROM assistant_usage_events"
-        ).fetchall()
+        conn.row_factory = sqlite3.Row
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not {"sessions", "assistant_usage_events"}.issubset(tables):
+            return []
+        def select_known(table: str, candidates: tuple[str, ...]) -> list[dict[str, Any]]:
+            available = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            columns = [column for column in candidates if column in available]
+            if not columns:
+                return []
+            return [dict(row) for row in conn.execute(f"SELECT {', '.join(columns)} FROM {table}")]
+        sessions = select_known("sessions", ("id", "cwd", "repository", "summary", "created_at", "updated_at"))
+        usage = select_known("assistant_usage_events", ("session_id", "model", "input_tokens", "output_tokens",
+                         "cache_read_tokens", "cache_write_tokens", "duration_ms", "total_nano_aiu", "created_at"))
+        turns = select_known("turns", ("session_id", "timestamp")) if "turns" in tables else []
     except sqlite3.Error:
         return []
     finally:
         conn.close()
 
     turn_counts: dict[str, int] = {}
-    turn_span: dict[str, list[str]] = {}
-    for session_id, timestamp in turn_rows:
+    turn_times: dict[str, list[str]] = {}
+    for row in turns:
+        session_id = row.get("session_id")
+        if not session_id:
+            continue
         turn_counts[session_id] = turn_counts.get(session_id, 0) + 1
-        iso = _cli_iso(timestamp)
-        if iso:
-            span = turn_span.setdefault(session_id, [iso, iso])
-            span[0] = min(span[0], iso)
-            span[1] = max(span[1], iso)
+        stamp = _cli_iso(row.get("timestamp"))
+        if stamp:
+            span = turn_times.setdefault(session_id, [stamp, stamp])
+            span[0], span[1] = min(span[0], stamp), max(span[1], stamp)
 
     usage_by_session: dict[str, dict[str, Any]] = {}
-    for session_id, model, in_tok, out_tok, cache_read, duration_ms, nano_aiu in usage_rows:
-        agg = usage_by_session.setdefault(
-            session_id,
-            {"inputTokens": 0, "outputTokens": 0, "cachedTokens": 0, "genMs": 0.0, "credits": 0.0, "models": {}},
-        )
-        agg["inputTokens"] += in_tok or 0
-        agg["outputTokens"] += out_tok or 0
-        agg["cachedTokens"] += cache_read or 0
-        agg["genMs"] += duration_ms or 0
-        agg["credits"] += (nano_aiu or 0) / 1_000_000_000
+    for row in usage:
+        session_id = row.get("session_id")
+        if not session_id:
+            continue
+        agg = usage_by_session.setdefault(session_id, {"events": [], "models": {}, "genMs": 0, "genCount": 0})
+        model = row.get("model") if isinstance(row.get("model"), str) else None
+        in_tok = _valid_count(row.get("input_tokens"))
+        out_tok = _valid_count(row.get("output_tokens"))
+        cached = _valid_count(row.get("cache_read_tokens"))
+        if cached is not None and (in_tok is None or cached > in_tok):
+            cached = None
+        cache_write = _valid_count(row.get("cache_write_tokens"))
+        nano_aiu = _valid_count(row.get("total_nano_aiu"))
+        duration = _valid_count(row.get("duration_ms"))
+        event = {"timestamp": _cli_iso(row.get("created_at")), "model": display_model_name(model, catalog),
+                 "inputTokens": in_tok, "outputTokens": out_tok, "cachedTokens": cached,
+                 "cacheWriteTokens": cache_write, "credits": nano_aiu / 1_000_000_000 if nano_aiu is not None else None,
+                 "creditsQuality": "reported" if nano_aiu is not None else "unavailable",
+                 "priceSource": "Copilot CLI total_nano_aiu" if nano_aiu is not None else None,
+                 "modelAttribution": "observed"}
+        agg["events"].append(event)
         if model:
             agg["models"][model] = agg["models"].get(model, 0) + 1
+        if duration is not None:
+            agg["genMs"] += duration
+            agg["genCount"] += 1
 
-    sessions: list[dict[str, Any]] = []
-    for session_id, cwd, repository, summary, created_at, updated_at in session_rows:
-        usage = usage_by_session.get(session_id, {})
+    result: list[dict[str, Any]] = []
+    for session in sessions:
+        session_id = session.get("id")
+        if not session_id:
+            continue
+        aggregate = usage_by_session.get(session_id, {})
+        events = aggregate.get("events", [])
         message_count = turn_counts.get(session_id, 0)
-        title = summary.strip() if isinstance(summary, str) and summary.strip() else "(untitled)"
+        title = session.get("summary")
+        title = title.strip() if isinstance(title, str) and title.strip() else "(untitled)"
         if title == "(untitled)" and not message_count:
-            continue  # hidden empty, mirrors the classic session logs' own rule
-
-        if isinstance(cwd, str) and cwd:
-            workspace = Path(cwd).name or cwd
-        elif isinstance(repository, str) and repository:
-            workspace = repository
-        else:
-            workspace = "(no workspace)"
-
-        models = usage.get("models") or {}
+            continue
+        cwd, repository = session.get("cwd"), session.get("repository")
+        workspace = Path(cwd).name or cwd if isinstance(cwd, str) and cwd else repository or "(no workspace)"
+        models = aggregate.get("models", {})
         top_model = max(models, key=models.get) if models else None
-
-        span = turn_span.get(session_id)
-        runtime_ms = None
+        span = turn_times.get(session_id)
+        runtime = None
         if span:
             try:
-                start = datetime.fromisoformat(span[0])
-                end = datetime.fromisoformat(span[1])
-                runtime_ms = (end - start).total_seconds() * 1000
+                runtime = (datetime.fromisoformat(span[1]) - datetime.fromisoformat(span[0])).total_seconds() * 1000
             except ValueError:
-                runtime_ms = None
-
-        sessions.append(
-            {
-                "id": session_id,
-                "title": title,
-                "workspace": workspace,
-                "mode": "cli",
-                "model": display_model_name(top_model, catalog),
-                "messages": message_count,
-                "credits": round(usage.get("credits", 0.0), 4),
-                "inputTokens": usage.get("inputTokens") or None,
-                "outputTokens": usage.get("outputTokens") or None,
-                "cachedTokens": usage.get("cachedTokens") or None,
-                "contextWindow": model_context_window(top_model, catalog),
-                "genMs": usage.get("genMs") or None,
-                "runtimeMs": runtime_ms,
-                "createdAt": _cli_iso(created_at),
-                "updatedAt": _cli_iso(updated_at) or _cli_iso(created_at),
-            }
-        )
-    return sessions
+                pass
+        def summed(field: str) -> int | None:
+            values = [event[field] for event in events]
+            return sum(values) if values and all(value is not None for value in values) else None
+        credit_values = [event["credits"] for event in events]
+        credits = sum(value for value in credit_values if value is not None) if any(value is not None for value in credit_values) else None
+        credits_quality = "reported" if credit_values and all(value is not None for value in credit_values) else "partial" if credits is not None else "unavailable"
+        result.append({
+            "id": session_id, "title": title, "workspace": workspace, "mode": "cli",
+            "model": display_model_name(top_model, catalog), "messages": message_count,
+            "credits": round(credits, 6) if credits is not None else None, "creditsQuality": credits_quality,
+            "creditsSource": "Copilot CLI total_nano_aiu per-event totals",
+            "inputTokens": summed("inputTokens"), "outputTokens": summed("outputTokens"),
+            "cachedTokens": summed("cachedTokens"), "cacheWriteTokens": summed("cacheWriteTokens"),
+            "tokenQuality": "exact" if events and all(event[k] is not None for event in events for k in ("inputTokens", "outputTokens")) else "partial",
+            "contextUsage": None, "contextWindow": None, "currentContextTokens": None,
+            "genMs": aggregate.get("genMs") if aggregate.get("genCount") else None,
+            "runtimeMs": runtime, "createdAt": _cli_iso(session.get("created_at")),
+            "updatedAt": _cli_iso(session.get("updated_at")) or _cli_iso(session.get("created_at")),
+            "activity": events, "untimestampedCalls": sum(1 for event in events if event["timestamp"] is None),
+            "priceSources": ["Copilot CLI total_nano_aiu"] if events else [],
+        })
+    return result
 
 
 def _sort_key(session: dict[str, Any]) -> float:
@@ -695,44 +943,63 @@ def read_state(user_dir: Path) -> dict[str, Any]:
             continue
         harvest_model_catalog(doc, catalog)
         parsed.append((doc, workspace, jsonl_path.stem))
-
-    load_live_model_pricing(user_dir)
+    snapshots = load_live_model_pricing(user_dir)
+    for snapshot in snapshots:
+        for slug, model in snapshot["models"].items():
+            entry = catalog.setdefault(slug, {})
+            if model.get("name"):
+                entry.setdefault("name", model["name"])
+            if model.get("maxInputTokens"):
+                entry.setdefault("maxInputTokens", model["maxInputTokens"])
 
     sessions: list[dict[str, Any]] = []
     for doc, workspace, fallback_id in parsed:
-        session = extract_session(doc, workspace, catalog, fallback_id)
+        session = extract_session(doc, workspace, catalog, fallback_id, snapshots)
         if session is not None:
             sessions.append(session)
-
     hidden_empty = len(parsed) - len(sessions)
-    sessions.extend(read_copilot_cli_sessions(catalog))
-
+    chat_ids = {session["id"] for session in sessions}
+    cli_sessions = read_copilot_cli_sessions(catalog)
+    duplicates = sum(1 for session in cli_sessions if session["id"] in chat_ids)
+    sessions.extend(session for session in cli_sessions if session["id"] not in chat_ids)
     sessions.sort(key=_sort_key, reverse=True)
     return {
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "userDir": str(user_dir),
+        "generatedAt": datetime.now(timezone.utc).isoformat(), "userDir": str(user_dir),
         "hiddenEmpty": hidden_empty,
-        "plan": {
-            "name": resolve_plan_name(user_dir) or FALLBACK_PLAN_NAME,
-            "limit": 0,  # no local cache of a numeric monthly quota exists for any plan tier
-            "account": resolve_subscription_account(user_dir),
-        },
+        "plan": {"name": resolve_plan_name(user_dir) or FALLBACK_PLAN_NAME, "limit": 0,
+                 "account": resolve_subscription_account(user_dir)},
         "sessions": sessions,
+        "accounting": {"priceCatalogSnapshots": len(snapshots), "duplicateCliSessionsExcluded": duplicates,
+                       "untimestampedCalls": sum(session.get("untimestampedCalls", 0) for session in sessions),
+                       "offline": True},
     }
 
 
 HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GitHub Copilot Session Dashboard</title><style>
-:root{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:white;background:#000;line-height:1.4}*{box-sizing:border-box}body{margin:0}.shell{max-width:1780px;margin:auto;padding:32px 24px 48px}header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:28px}h1{font-size:25px;letter-spacing:-.02em;margin:0 0 5px}h2{font-size:16px;margin:0 0 16px}.muted,.meta{color:#9da69e;font-size:13px}.actions{display:flex;gap:9px;align-items:center}button,.input{font:inherit;border:1px solid #d5d9e0;border-radius:7px;background:#343836;padding:8px 11px;color:inherit}button{cursor:pointer}button:hover{background:#454b48}input[type=checkbox]{accent-color:#343836}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}.card,.panel{border-radius:10px;box-shadow:0 1px 2px #00000008}.panel{border:1px solid #5eed83}.card{background:#0f1511;padding:17px}.card-label{text-transform:uppercase;letter-spacing:.07em;color:#9da69e;font-size:11px;font-weight:650}.metric{font-size:23px;font-weight:650;margin:8px 0 3px}.panel{padding:20px}.panel-head{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:16px}.controls{display:flex;gap:9px;flex-wrap:wrap}.search{min-width:260px}.table-wrap{overflow:auto;margin:0 -20px}.session-table{width:100%;border-collapse:collapse;min-width:980px}.session-table th,.session-table td{text-align:left;padding:11px 10px;border-top:0.1px solid #2a2c2a;font-size:13px;white-space:nowrap}.session-table th{color:#9da69e;font-weight:600;font-size:12px;cursor:pointer}.session-table th:hover{color:white}.session-table tbody tr:hover{background:#1a201c}.title{max-width:220px;overflow:hidden;text-overflow:ellipsis}.workspace{max-width:150px;overflow:hidden;text-overflow:ellipsis}.share-col{padding-left:6px;padding-right:3px}.session-table th[data-sort="updatedAt"],.session-table td.updated{width:1%}.session-table th[data-sort="messages"],.session-table td.messages{width:1%}.tip{position:fixed;z-index:2000;background:#343836;color:#fff;padding:6px 9px;border-radius:6px;font-size:12px;max-width:420px;white-space:normal;word-break:break-word;pointer-events:none;box-shadow:0 4px 14px #00000033}.badge{display:inline-block;padding:3px 7px;border-radius:12px;background:#5eed83;color:black;font-size:11px}.footer{padding-top:13px}.settings{display:flex;align-items:center;gap:7px;font-size:13px}.error{padding:20px;color:#a12727;background:#fff0f0;border:1px solid #f2c8c8;border-radius:10px;white-space:pre-wrap}.nowrap{white-space:nowrap}.share-btn{border:0;background:none;padding:0;width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border-radius:6px;color:#9da69e;cursor:pointer}.share-btn:hover{background:#454b48;color:white}.session-table th.no-sort{cursor:default}.share-menu{position:fixed;background:#0f1511;border:1px solid #d5d9e0;border-radius:8px;box-shadow:0 6px 20px #0000001f;z-index:1000;min-width:170px;padding:5px;font-size:13px}.share-menu button{display:block;width:100%;text-align:left;border:0;background:none;border-radius:6px;padding:7px 11px;font:inherit;color:inherit;cursor:pointer}.share-menu button:hover{background:#454b48}@media(max-width:850px){.grid{grid-template-columns:repeat(2,1fr)}header,.panel-head{align-items:flex-start;flex-direction:column}}@media(max-width:500px){.shell{padding:22px 14px}.grid{grid-template-columns:1fr}.actions{width:100%}.actions button{flex:1}}
+:root{__THEME_VARS__;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--fg);background:var(--bg);line-height:1.4}*{box-sizing:border-box}body{margin:0}.shell{max-width:1780px;margin:auto;padding:32px 24px 48px}header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:28px}h1{font-size:25px;letter-spacing:-.02em;margin:0 0 5px}h2{font-size:16px;margin:0 0 16px}.muted,.meta{color:var(--muted);font-size:13px}.actions{display:flex;gap:9px;align-items:center}button,.input{font:inherit;border:1px solid var(--border);border-radius:7px;background:var(--control-bg);padding:8px 11px;color:inherit}button{cursor:pointer}button:hover{background:var(--control-hover)}input[type=checkbox]{accent-color:var(--control-bg)}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}.card,.panel{border-radius:10px;box-shadow:0 1px 2px var(--card-shadow)}.panel{border:1px solid var(--accent)}.card{background:var(--card-bg);padding:17px}.card-label{text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-size:11px;font-weight:650}.metric{font-size:23px;font-weight:650;margin:8px 0 3px}.panel{padding:20px}.panel-head{display:flex;justify-content:space-between;align-items:center;gap:14px;margin-bottom:16px}.controls{display:flex;gap:9px;flex-wrap:wrap}.search{min-width:260px}.table-wrap{overflow:auto;margin:0 -20px}.session-table{width:100%;border-collapse:collapse;min-width:980px}.session-table th,.session-table td{text-align:left;padding:11px 10px;border-top:0.1px solid var(--table-border);font-size:13px;white-space:nowrap}.session-table th{color:var(--muted);font-weight:600;font-size:12px;cursor:pointer}.session-table th:hover{color:var(--fg)}.session-table tbody tr:hover{background:var(--row-hover)}.title{max-width:220px;overflow:hidden;text-overflow:ellipsis}.workspace{max-width:150px;overflow:hidden;text-overflow:ellipsis}.share-col{padding-left:6px;padding-right:3px}.session-table th[data-sort="updatedAt"],.session-table td.updated{width:1%}.session-table th[data-sort="messages"],.session-table td.messages{width:1%}.tip{position:fixed;z-index:2000;background:var(--control-bg);color:var(--fg);padding:6px 9px;border-radius:6px;font-size:12px;max-width:420px;white-space:normal;word-break:break-word;pointer-events:none;box-shadow:0 4px 14px var(--popup-shadow)}.badge{display:inline-block;padding:3px 7px;border-radius:12px;background:var(--accent);color:var(--badge-fg);font-size:11px}.footer{padding-top:13px}.settings{display:flex;align-items:center;gap:7px;font-size:13px}.error{padding:20px;color:var(--error-fg);background:var(--error-bg);border:1px solid var(--error-border);border-radius:10px;white-space:pre-wrap}.nowrap{white-space:nowrap}.share-btn{border:0;background:none;padding:0;width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border-radius:6px;color:var(--muted);cursor:pointer}.share-btn:hover{background:var(--control-hover);color:var(--fg)}.session-table th.no-sort{cursor:default}.share-menu{position:fixed;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 6px 20px var(--menu-shadow);z-index:1000;min-width:170px;padding:5px;font-size:13px}.share-menu button{display:block;width:100%;text-align:left;border:0;background:none;border-radius:6px;padding:7px 11px;font:inherit;color:inherit;cursor:pointer}.share-menu button:hover{background:var(--control-hover)}@media(max-width:850px){.grid{grid-template-columns:repeat(2,1fr)}header,.panel-head{align-items:flex-start;flex-direction:column}}@media(max-width:500px){.shell{padding:22px 14px}.grid{grid-template-columns:1fr}.actions{width:100%}.actions button{flex:1}}
 </style></head><body><main class="shell"><header><div><h1>GitHub Copilot Session Dashboard</h1><div class="meta" id="source">Loading local state…</div></div><div class="actions"><span class="meta" id="asof"></span><button id="refresh" title="Refresh" aria-label="Refresh" style="display:inline-flex;align-items:center;justify-content:center"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.61-3.89"/><polyline points="13.5 1.5 13.5 4.5 10.5 4.5"/></svg></button><label class="settings"><input id="auto" type="checkbox"> Auto-refresh</label></div></header><div id="app"><div class="muted">Loading…</div></div><div id="tip" class="tip" hidden></div></main><script>
 const CREDIT_USD_RATE=__CREDIT_USD_RATE__;
 const state={data:null,sort:'updatedAt',desc:true};const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const date=v=>v?new Date(v).toLocaleString([], {dateStyle:'medium',timeStyle:'short'}):'—';const dte=v=>v?new Date(v).toLocaleDateString([], {dateStyle:'medium'}):'—';const dmy=v=>{if(!v)return'—';const d=new Date(v);return`${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}/${String(d.getFullYear()).slice(-2)}`};const fmt=v=>v==null?'—':Number(v).toLocaleString();const dur=v=>{if(v==null)return'—';const s=Math.round(Number(v)/1000);if(s<60)return`${s}s`;const m=Math.floor(s/60);if(m<60)return`${m}m ${s%60}s`;return`${(s/3600).toFixed(1)}h`};
-function render(){closeShareMenu();hideTip();const d=state.data,p=d.plan||{},rate=CREDIT_USD_RATE;const now=new Date(),monthSessions=(d.sessions||[]).filter(s=>{const t=s.createdAt?new Date(s.createdAt):null;return t&&t.getMonth()===now.getMonth()&&t.getFullYear()===now.getFullYear()});const consumed=monthSessions.reduce((a,s)=>a+(Number(s.credits)||0),0),est=(consumed*rate).toFixed(2);const tokIn=monthSessions.reduce((a,s)=>a+(Number(s.inputTokens)||0),0),tokOut=monthSessions.reduce((a,s)=>a+(Number(s.outputTokens)||0),0),modelCounts={},modelTok={},modelCredits={};monthSessions.forEach(s=>{if(s.model&&s.model!=='—'){modelCounts[s.model]=(modelCounts[s.model]||0)+1;modelTok[s.model]=(modelTok[s.model]||0)+(Number(s.inputTokens)||0)+(Number(s.outputTokens)||0);modelCredits[s.model]=(modelCredits[s.model]||0)+(Number(s.credits)||0)}});const top=o=>Object.entries(o).sort((a,b)=>b[1]-a[1])[0],topTok=top(modelTok),topCred=top(modelCredits),topCnt=top(modelCounts);
+function renderLegacy(){closeShareMenu();hideTip();const d=state.data,p=d.plan||{},rate=CREDIT_USD_RATE;const now=new Date(),monthSessions=(d.sessions||[]).filter(s=>{const t=s.createdAt?new Date(s.createdAt):null;return t&&t.getMonth()===now.getMonth()&&t.getFullYear()===now.getFullYear()});const consumed=monthSessions.reduce((a,s)=>a+(Number(s.credits)||0),0),est=(consumed*rate).toFixed(2);const tokIn=monthSessions.reduce((a,s)=>a+(Number(s.inputTokens)||0),0),tokOut=monthSessions.reduce((a,s)=>a+(Number(s.outputTokens)||0),0),modelCounts={},modelTok={},modelCredits={};monthSessions.forEach(s=>{if(s.model&&s.model!=='—'){modelCounts[s.model]=(modelCounts[s.model]||0)+1;modelTok[s.model]=(modelTok[s.model]||0)+(Number(s.inputTokens)||0)+(Number(s.outputTokens)||0);modelCredits[s.model]=(modelCredits[s.model]||0)+(Number(s.credits)||0)}});const top=o=>Object.entries(o).sort((a,b)=>b[1]-a[1])[0],topTok=top(modelTok),topCred=top(modelCredits),topCnt=top(modelCounts);
 $('source').textContent=`Local Copilot sessions (Chat panel + CLI) · ${(d.sessions||[]).length} total`;$('asof').textContent=`Last update: ${date(d.generatedAt)}`;let rows=d.sessions||[];const prevSearch=$('search'),raw=prevSearch?.value||'',q=raw.toLowerCase(),focused=prevSearch&&document.activeElement===prevSearch,caret=prevSearch?.selectionStart;if(q)rows=rows.filter(s=>[s.title,s.workspace,s.id,s.model,s.mode].join(' ').toLowerCase().includes(q));rows.sort((a,b)=>{const v=s=>state.sort==='cost'?(s.credits==null?'':s.credits*rate):s[state.sort];let x=v(a)??'',y=v(b)??'';if(state.sort.includes('At')){x=new Date(x||0).getTime();y=new Date(y||0).getTime()}else if(typeof x==='string'){x=x.toLowerCase();y=String(y).toLowerCase()}return (x<y?-1:x>y?1:0)*(state.desc?-1:1)});
 $('app').innerHTML=`<section class="grid"><article class="card"><div class="card-label">Plan</div><div class="metric">${esc(p.name)}</div>${p.account?`<div class="muted">@${esc(p.account)}</div>`:''}<div class="card-label" style="margin-top:14px">Estimated cost (this month)</div><div class="metric">$${est}</div><div class="muted">$${rate.toFixed(2)} / credit</div></article><article class="card"><div class="card-label">Credits consumed</div><div class="metric">${consumed.toFixed(2)}</div><div class="muted">Unlimited plan allotment</div><div class="muted">Estimated locally from logged token usage</div></article><article class="card"><div class="card-label">Sessions this month</div><div class="metric">${fmt(monthSessions.length)}</div><div class="muted">Tokens:</div><div class="muted">IN ${fmt(tokIn)} · OUT ${fmt(tokOut)}</div></article><article class="card"><div class="card-label">Model metrics</div><div class="metric">${fmt(Object.keys(modelCounts).length)}</div><div class="muted">Top by tokens: ${topTok?esc(topTok[0])+' · '+fmt(topTok[1]):'—'}</div><div class="muted">Top by credits: ${topCred?esc(topCred[0])+' · '+topCred[1].toFixed(2):'—'}</div><div class="muted">Top by count: ${topCnt?esc(topCnt[0])+' · '+fmt(topCnt[1]):'—'}</div></article></section><section class="panel"><div class="panel-head"><div><h2>Sessions <span class="muted">(${rows.length!==d.sessions.length?`${rows.length} of `:''}${d.sessions.length} Total)</span></h2></div><div class="controls"><input class="input search" id="search" placeholder="Search title, workspace, model…" value="${esc(raw)}"></div></div><div class="table-wrap"><table class="session-table"><thead><tr><th class="no-sort share-col"></th>${[['updatedAt','Last updated'],['workspace','Workspace'],['title','Title'],['model','Model'],['mode','Mode'],['credits','Credits'],['cost','Est. cost'],['inputTokens','Tokens in'],['outputTokens','Tokens out'],['cachedTokens','Cached'],['contextWindow','Context'],['genMs','Gen. time'],['runtimeMs','Runtime'],['createdAt','Created'],['messages',MESSAGE_ICON_SVG]].map(([k,l])=>`<th data-sort="${k}">${l}${state.sort===k?' '+(state.desc?'↓':'↑'):''}</th>`).join('')}</tr></thead><tbody>${rows.map(s=>`<tr><td class="nowrap share-col"><button class="share-btn" data-id="${esc(s.id)}" title="Share" aria-label="Share session">${SHARE_ICON_SVG}</button></td><td class="nowrap updated">${date(s.updatedAt)}</td><td class="workspace">${esc(s.workspace||'—')}</td><td class="title">${esc(s.title)}</td><td>${esc(s.model||'—')}</td><td class="nowrap"><span class="badge">${esc(s.mode||'—')}</span></td><td class="nowrap">${s.credits==null?'—':s.credits.toFixed(3)}</td><td class="nowrap">${s.credits==null?'—':'$'+(s.credits*rate).toFixed(2)}</td><td class="nowrap">${fmt(s.inputTokens)}</td><td class="nowrap">${fmt(s.outputTokens)}</td><td class="nowrap">${fmt(s.cachedTokens)}</td><td class="nowrap">${fmt(s.contextWindow)}</td><td class="nowrap">${dur(s.genMs)}</td><td class="nowrap">${dur(s.runtimeMs)}</td><td class="nowrap">${dmy(s.createdAt)}</td><td class="messages">${s.messages}</td></tr>`).join('')||'<tr><td colspan="16" class="muted">No sessions match this search.</td></tr>'}</tbody></table></div><div class="footer muted">${d.sessions.length} sessions loaded from local VS Code Copilot Chat logs and the Copilot CLI's own session history.${d.hiddenEmpty?' '+d.hiddenEmpty+' empty sessions (no title, no messages) hidden.':''} Chat panel credits are estimated locally from logged token usage using GitHub's published per-model rates; CLI sessions (mode "cli") use the CLI's own already-computed cost. Neither is the authoritative total from your GitHub account.</div></section>`;
 $('search').addEventListener('input',render);document.querySelectorAll('[data-sort]').forEach(el=>el.addEventListener('click',()=>{if(state.sort===el.dataset.sort)state.desc=!state.desc;else{state.sort=el.dataset.sort;state.desc=true}render()}));const search=$('search');if(search&&focused){search.focus();search.setSelectionRange(caret??raw.length,caret??raw.length)}}
+function render(){
+ closeShareMenu();hideTip();const d=state.data,p=d.plan||{},sessions=d.sessions||[],now=new Date(),monthCalls=[],unknownTime=sessions.reduce((n,s)=>n+(s.untimestampedCalls||0),0);
+ sessions.forEach(s=>(s.activity||[]).forEach(c=>{if(!c.timestamp)return;const t=new Date(c.timestamp);if(!isNaN(t)&&t.getMonth()===now.getMonth()&&t.getFullYear()===now.getFullYear())monthCalls.push({...c,sessionId:s.id})}));
+ const monthSessionCount=new Set(monthCalls.map(c=>c.sessionId)).size,billableCalls=monthCalls.filter(c=>c.creditsQuality!=='byok'),hasBillableCalls=billableCalls.length>0,knownCredits=billableCalls.reduce((n,c)=>n+(c.credits==null?0:Number(c.credits)),0),creditMissing=billableCalls.some(c=>c.credits==null),estimated=billableCalls.some(c=>String(c.creditsQuality||'').startsWith('estimated')||c.creditsQuality==='partial'),incompleteTokens=key=>monthCalls.some(c=>c[key]==null),sum=key=>monthCalls.reduce((n,c)=>n+(c[key]==null?0:Number(c[key])),0);
+ const tokIn=sum('inputTokens'),tokOut=sum('outputTokens'),models={};monthCalls.forEach(c=>{const parts=c.modelBreakdown?.length?c.modelBreakdown:[{model:c.model,inputTokens:c.inputTokens,outputTokens:c.outputTokens}],perCall={};parts.forEach(part=>{if(!part.model||part.model==='—')return;const m=perCall[part.model]||(perCall[part.model]={tokens:0});m.tokens+=(Number(part.inputTokens)||0)+(Number(part.outputTokens)||0)});Object.entries(perCall).forEach(([name,part])=>{const m=models[name]||(models[name]={calls:0,tokens:0,credits:0,creditCalls:0,estimatedCalls:0});m.calls++;m.tokens+=part.tokens;if(Object.keys(perCall).length===1&&c.credits!=null){m.credits+=Number(c.credits);m.creditCalls++;if(String(c.creditsQuality||'').startsWith('estimated')||c.creditsQuality==='partial')m.estimatedCalls++}})});
+ const top=(key,field)=>Object.entries(models).sort((a,b)=>b[1][field]-a[1][field])[0],topTok=top('tokens','tokens'),topCred=top('credits','credits'),topCount=top('calls','calls');
+ $('source').textContent=`Offline local Copilot sessions (Chat panel + CLI) · ${sessions.length} total`;$('asof').textContent=`Last update: ${date(d.generatedAt)}`;
+ let rows=sessions;const prev=$('search'),raw=prev?.value||'',q=raw.toLowerCase(),focused=prev&&document.activeElement===prev,caret=prev?.selectionStart;if(q)rows=rows.filter(s=>[s.title,s.workspace,s.id,s.model,s.mode].join(' ').toLowerCase().includes(q));
+ rows=[...rows].sort((a,b)=>{const v=s=>state.sort==='cost'?(s.credits==null?null:s.credits*CREDIT_USD_RATE):s[state.sort];let x=v(a),y=v(b);if(x==null)x='';if(y==null)y='';if(state.sort.includes('At')){x=new Date(x||0).getTime();y=new Date(y||0).getTime()}else if(typeof x==='string'){x=x.toLowerCase();y=String(y).toLowerCase()}return(x<y?-1:x>y?1:0)*(state.desc?-1:1)});
+ const creditText=!hasBillableCalls?'—':creditMissing?(knownCredits?'≥ '+knownCredits.toFixed(2):'—'):`${estimated?'~':''}${knownCredits.toFixed(2)}`,usdText=!hasBillableCalls?'—':(creditMissing?'≥ ':estimated?'~ ':'')+'$'+(knownCredits*CREDIT_USD_RATE).toFixed(2),monthNote=monthCalls.length?`${monthCalls.length} timestamped calls${unknownTime?` · ${unknownTime} calls have no timestamp and are excluded`:''}`:'No timestamped calls this month';
+ $('app').innerHTML=`<section class="grid"><article class="card"><div class="card-label">Plan</div><div class="metric">${esc(p.name||'GitHub Copilot')}</div>${p.account?`<div class="muted">@${esc(p.account)}</div>`:''}<div class="card-label" style="margin-top:14px">Cost this month</div><div class="metric">${usdText}</div><div class="muted">${!hasBillableCalls?'No Copilot-billed calls':creditMissing?(estimated?'Incomplete coverage; includes estimates':'Incomplete per-call coverage'):estimated?'Includes local estimates':'From reported credits'} · $${CREDIT_USD_RATE.toFixed(2)} / credit</div></article><article class="card"><div class="card-label">Credits this month</div><div class="metric">${creditText}</div><div class="muted">${!hasBillableCalls?'No Copilot-billed calls':creditMissing?(estimated?'Known subtotal; incomplete and estimated':'Known subtotal; incomplete coverage'):estimated?'Reported and estimated amounts':'Reported per-call credits'}</div><div class="muted">${esc(monthNote)}</div></article><article class="card"><div class="card-label">Sessions this month</div><div class="metric">${fmt(monthSessionCount)}</div><div class="muted">Per-call activity by local calendar month</div><div class="muted">IN ${monthCalls.length?(incompleteTokens('inputTokens')?'≥ ':'')+fmt(tokIn):'—'} · OUT ${monthCalls.length?(incompleteTokens('outputTokens')?'≥ ':'')+fmt(tokOut):'—'} · Cached subset ${monthCalls.length?(incompleteTokens('cachedTokens')?'partial · ':'')+fmt(sum('cachedTokens')):'—'}</div></article><article class="card"><div class="card-label">Model metrics this month</div><div class="metric">${fmt(Object.keys(models).length)}</div><div class="muted">Top by tokens${incompleteTokens('inputTokens')||incompleteTokens('outputTokens')?' (partial)':''}${monthCalls.some(c=>c.modelAttribution==='approximate')?' (approximate)':''}: ${topTok?`${esc(topTok[0])} · ${fmt(topTok[1].tokens)}`:'—'}</div><div class="muted">Top by known credits: ${topCred?`${esc(topCred[0])} · ${topCred[1].estimatedCalls?'~':''}${topCred[1].credits.toFixed(2)}${topCred[1].creditCalls<topCred[1].calls?' (partial)':''}`:'—'}</div><div class="muted">Top by calls: ${topCount?`${esc(topCount[0])} · ${fmt(topCount[1].calls)}`:'—'} · request-model attribution</div></article></section><section class="panel"><div class="panel-head"><div><h2>Sessions <span class="muted">(${rows.length!==sessions.length?`${rows.length} of `:''}${sessions.length} total)</span></h2><div class="muted">Lifetime totals; Cached is a subset of IN. Current context is the latest persisted response only.</div></div><div class="controls"><input class="input search" id="search" placeholder="Search title, workspace, model…" value="${esc(raw)}"></div></div><div class="table-wrap"><table class="session-table"><thead><tr><th class="no-sort share-col"></th>${[['updatedAt','Last updated'],['workspace','Workspace'],['title','Title'],['model','Model'],['mode','Mode'],['credits','Credits'],['cost','Cost'],['inputTokens','IN lifetime'],['outputTokens','OUT lifetime'],['cachedTokens','Cached subset'],['cacheWriteTokens','Cache writes'],['currentContextTokens','Current context'],['genMs','Gen. time'],['messages','Calls']].map(([k,v])=>`<th data-sort="${k==='credits'?'credits':k==='cost'?'cost':k}">${v}</th>`).join('')}</tr></thead><tbody>${rows.map(s=>{const cu=s.contextUsage,credits=s.credits==null?'—':`${s.credits.toFixed(3)}${s.creditsQuality==='reported'||s.creditsQuality==='reported/reconciled'?'':'*'}`,context=cu?`${fmt(cu.currentTokens)}${cu.tokenLimit?` / ${fmt(cu.tokenLimit)} (${cu.percent}%)`:''}`:'—';return`<tr><td class="share-col"><button class="share-btn" data-id="${esc(s.id)}" title="Share session" aria-label="Share session">${SHARE_ICON_SVG}</button></td><td class="updated" title="${esc(s.updatedAt||'Unavailable')}">${date(s.updatedAt)}</td><td class="workspace" title="${esc(s.workspace)}">${esc(s.workspace)}</td><td class="title" title="${esc(s.title)}">${esc(s.title)}</td><td title="${esc((s.priceSources||[]).join('; '))}">${esc(s.model)}</td><td>${esc(s.mode)}</td><td title="${esc(s.creditsSource||s.creditsQuality||'unavailable')}">${credits}</td><td>${s.credits==null?'—':`${s.creditsQuality==='reported'||s.creditsQuality==='reported/reconciled'?'':'~'}${estCost(s)}`}</td><td title="${esc(s.tokenQuality||'unavailable')}">${fmt(s.inputTokens)}${s.tokenQuality==='partial'?'*':''}</td><td title="${esc(s.tokenQuality||'unavailable')}">${fmt(s.outputTokens)}${s.tokenQuality==='partial'?'*':''}</td><td title="Cache reads are included in IN">${fmt(s.cachedTokens)}</td><td>${fmt(s.cacheWriteTokens)}</td><td title="${esc(cu?.source||'No current context data')}">${context}</td><td>${dur(s.genMs)}</td><td class="messages">${fmt(s.messages)}</td></tr>`}).join('')}</tbody></table></div><div class="muted footer">* Estimated or partial amount. — means unavailable, not zero. Monthly totals omit calls without timestamps; model credit ranking is based on observed request-model attribution.</div></section>`;
+ $('search').addEventListener('input',render);document.querySelectorAll('[data-sort]').forEach(el=>el.addEventListener('click',()=>{if(state.sort===el.dataset.sort)state.desc=!state.desc;else{state.sort=el.dataset.sort;state.desc=true}render()}));const search=$('search');if(search&&focused){search.focus();search.setSelectionRange(caret??raw.length,caret??raw.length)}
+}
 const SHARE_ICON_SVG='<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.6v7.9"/><polyline points="4.9 4.8 8 1.6 11.1 4.8"/><path d="M4.6 6.6H3.6a1 1 0 0 0-1 1v5.8a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V7.6a1 1 0 0 0-1-1h-1"/></svg>';
 const MESSAGE_ICON_SVG='<span title="Messages" aria-label="Messages" style="display:inline-flex;vertical-align:middle"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10.5a1.5 1.5 0 0 1-1.5 1.5H5l-3 2.5V3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5z"/></svg></span>';
 let shareMenu=null;
@@ -740,9 +1007,9 @@ function closeShareMenu(){if(!shareMenu)return;const m=shareMenu;shareMenu=null;
 function shareFileDate(s){const v=s.createdAt||s.updatedAt;const d=v?new Date(v):new Date();if(isNaN(d))return new Date().toISOString().slice(0,10);const p=n=>String(n).padStart(2,'0');return`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`}
 function shareSanitize(v){return String(v||'').replace(/[\\/:*?"<>|\x00-\x1f]/g,'-').replace(/\s+/g,' ').replace(/^[.\s]+/,'').replace(/[.\s]+$/,'').slice(0,80).trim()}
 function shareFilename(s){let base=shareSanitize(s.title);if(!base||base==='(untitled)')base=shareSanitize(s.id)||'session';return`${base} ${shareFileDate(s)}.md`}
-function estCost(s){return s.credits==null?'—':'$'+(s.credits*CREDIT_USD_RATE).toFixed(2)}
-function sessionMarkdown(s){const pipe=v=>String(v??'').replace(/\|/g,'\\|');const val=v=>pipe(v==null||v===''?'—':v);return['# '+pipe(s.title||'(untitled)'),'','| Field | Value |','| --- | --- |','| Session ID | '+val(s.id)+' |','| Workspace | '+val(s.workspace)+' |','| Mode | '+val(s.mode)+' |','| Model | '+val(s.model)+' |','| Messages | '+val(s.messages)+' |','| Credits consumed | '+(s.credits==null?'—':s.credits.toFixed(3))+' |','| Est. cost | '+estCost(s)+' |','| Tokens in | '+fmt(s.inputTokens)+' |','| Tokens out | '+fmt(s.outputTokens)+' |','| Tokens cached | '+fmt(s.cachedTokens)+' |','| Context window | '+fmt(s.contextWindow)+' |','| Gen. time | '+dur(s.genMs)+' |','| Runtime | '+dur(s.runtimeMs)+' |','| Created | '+date(s.createdAt)+' |','| Last updated | '+date(s.updatedAt)+' |','','Estimated at $'+CREDIT_USD_RATE.toFixed(2)+' / credit from locally logged token usage.'].join('\n')}
-async function copySessionJson(s){const text=JSON.stringify({...s,creditUsdRate:CREDIT_USD_RATE,estimatedCostUsd:s.credits==null?null:Number((s.credits*CREDIT_USD_RATE).toFixed(2))},null,2);try{await navigator.clipboard.writeText(text);return}catch(e){}const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy')}catch(e){}ta.remove()}
+function estCost(s){return s.credits==null?'—':(s.credits*CREDIT_USD_RATE).toFixed(2)}
+function sessionMarkdown(s){const pipe=v=>String(v??'').replace(/\|/g,'\\|'),val=v=>pipe(v==null||v===''?'—':v),cu=s.contextUsage;return['# '+pipe(s.title||'(untitled)'),'','| Field | Value |','| --- | --- |','| Session ID | '+val(s.id)+' |','| Workspace | '+val(s.workspace)+' |','| Mode | '+val(s.mode)+' |','| Model | '+val(s.model)+' |','| Calls | '+val(s.messages)+' |','| Credits | '+(s.credits==null?'—':s.credits.toFixed(6)+' ('+val(s.creditsQuality)+')')+' |','| Cost at $0.01/credit | '+(s.credits==null?'—':(s.credits*CREDIT_USD_RATE).toFixed(4))+' |','| Cost provenance | '+val(s.creditsSource)+' |','| IN lifetime | '+fmt(s.inputTokens)+' ('+val(s.tokenQuality)+') |','| OUT lifetime | '+fmt(s.outputTokens)+' ('+val(s.tokenQuality)+') |','| Cached subset of IN | '+fmt(s.cachedTokens)+' |','| Cache writes | '+fmt(s.cacheWriteTokens)+' |','| Current context | '+(cu?fmt(cu.currentTokens):'—')+' |','| Context limit | '+(cu?fmt(cu.tokenLimit):'—')+' |','| Context source | '+val(cu?.source)+' |','| Price source | '+val((s.priceSources||[]).join('; '))+' |','| Gen. time | '+dur(s.genMs)+' |','| Runtime | '+dur(s.runtimeMs)+' |','| Created | '+date(s.createdAt)+' |','| Last updated | '+date(s.updatedAt)+' |','','Costs prefer VS Code reported credits; rate-card values, when available, are estimates. Unknown is not zero.'].join('\n')}
+async function copySessionJson(s){const text=JSON.stringify({...s,creditUsdRate:CREDIT_USD_RATE,costUsd:s.credits==null?null:Number((s.credits*CREDIT_USD_RATE).toFixed(4)),costQuality:s.creditsQuality,costProvenance:s.creditsSource||s.priceSources||[]},null,2);try{await navigator.clipboard.writeText(text);return}catch(e){}const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();try{document.execCommand('copy')}catch(e){}ta.remove()}
 function downloadSessionMarkdown(s){const blob=new Blob([sessionMarkdown(s)],{type:'text/markdown'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=shareFilename(s);document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url)}
 function openShareMenu(btn,s){closeShareMenu();const el=document.createElement('div');el.className='share-menu';const copy=document.createElement('button');copy.type='button';copy.textContent='Copy JSON';const dl=document.createElement('button');dl.type='button';dl.textContent='Download .md file';el.append(copy,dl);document.body.appendChild(el);const r=btn.getBoundingClientRect(),w=el.offsetWidth,h=el.offsetHeight;let top=r.bottom+6,left=r.right-w;if(top+h>window.innerHeight-8&&r.top-h-6>=8)top=r.top-h-6;left=Math.max(8,Math.min(left,window.innerWidth-w-8));el.style.top=top+'px';el.style.left=left+'px';const onDoc=e=>{if(!el.contains(e.target)&&e.target!==btn)closeShareMenu()};const onKey=e=>{if(e.key==='Escape')closeShareMenu()};document.addEventListener('click',onDoc,true);document.addEventListener('keydown',onKey);shareMenu={el,onDoc,onKey};copy.addEventListener('click',async()=>{await copySessionJson(s);copy.textContent='Copied!';setTimeout(closeShareMenu,1000)});dl.addEventListener('click',()=>{downloadSessionMarkdown(s);closeShareMenu()})}
 document.addEventListener('click',e=>{const btn=e.target.closest&&e.target.closest('.share-btn');if(!btn)return;const s=(state.data&&state.data.sessions||[]).find(x=>x.id===btn.dataset.id);if(s)openShareMenu(btn,s)});
@@ -761,7 +1028,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/" or self.path == "/index.html":
-            html = HTML.replace("__CREDIT_USD_RATE__", str(CREDIT_USD_RATE))
+            html = HTML.replace("__CREDIT_USD_RATE__", str(CREDIT_USD_RATE)).replace("__THEME_VARS__", THEME_VARS_CSS)
             self.send_text(html, "text/html; charset=utf-8")
             return
         if self.path == "/api/data":
