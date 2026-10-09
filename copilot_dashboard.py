@@ -1005,7 +1005,8 @@ def _event_context_limit(model_id: str | None, catalog: dict[str, dict[str, Any]
 
 
 def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]], known_ids: set[str],
-                                    snapshots: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+                                    snapshots: list[dict[str, Any]] | None = None,
+                                    only_ids: set[str] | None = None) -> list[dict[str, Any]]:
     """Parse ~/.copilot/session-state/<id>/events.jsonl — the store used by Copilot
     sessions launched from VS Code's Agents window, which never land in session-store.db.
     Per-call tokens come from `session.usage_record`/`assistant.usage` when logged; otherwise
@@ -1016,7 +1017,7 @@ def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]], known_id
     sessions: list[dict[str, Any]] = []
     for events_path in sorted(state_dir.glob("*/events.jsonl")):
         session_id = events_path.parent.name
-        if session_id in known_ids:
+        if session_id in known_ids or (only_ids is not None and session_id not in only_ids):
             continue
         created_at: str | None = None
         last_stamp: str | None = None
@@ -1217,6 +1218,26 @@ def read_copilot_cli_event_sessions(catalog: dict[str, dict[str, Any]], known_id
     return sessions
 
 
+def backfill_cli_from_events(cli_sessions: list[dict[str, Any]], catalog: dict[str, dict[str, Any]],
+                             snapshots: list[dict[str, Any]]) -> None:
+    """session-store.db has no context usage, and its `turns` rows lag behind the live session
+    (often a single turn or none), so fill context, busy runtime and message count from events.jsonl."""
+    ids = {s["id"] for s in cli_sessions}
+    if not ids:
+        return
+    from_events = {s["id"]: s for s in read_copilot_cli_event_sessions(catalog, set(), snapshots, only_ids=ids)}
+    for session in cli_sessions:
+        events = from_events.get(session["id"])
+        if events is None:
+            continue
+        if session.get("contextUsage") is None and events.get("contextUsage"):
+            for key in ("contextUsage", "contextWindow", "currentContextTokens"):
+                session[key] = events.get(key)
+        if events.get("runtimeMs"):
+            session["runtimeMs"] = events["runtimeMs"]
+        session["messages"] = max(session.get("messages") or 0, events.get("messages") or 0)
+
+
 def _sort_key(session: dict[str, Any]) -> float:
     value = session.get("updatedAt")
     if not value:
@@ -1254,7 +1275,9 @@ def read_state(user_dir: Path) -> dict[str, Any]:
     chat_ids = {session["id"] for session in sessions}
     cli_sessions = read_copilot_cli_sessions(catalog)
     duplicates = sum(1 for session in cli_sessions if session["id"] in chat_ids)
-    sessions.extend(session for session in cli_sessions if session["id"] not in chat_ids)
+    cli_sessions = [session for session in cli_sessions if session["id"] not in chat_ids]
+    backfill_cli_from_events(cli_sessions, catalog, snapshots)
+    sessions.extend(cli_sessions)
     known_ids = {session["id"] for session in sessions}
     sessions.extend(read_copilot_cli_event_sessions(catalog, known_ids, snapshots))
     kept = [item for item in sessions if item.get("title") not in (None, "", "(untitled)") and item.get("credits") is not None]
