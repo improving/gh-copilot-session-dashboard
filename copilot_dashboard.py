@@ -1296,6 +1296,73 @@ def read_state(user_dir: Path) -> dict[str, Any]:
     }
 
 
+def _stat_signature(path: Path) -> tuple[str, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _state_signature(user_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Cheap fingerprint of every file read_state() reads: each file's mtime and size.
+
+    Lets the dashboard reuse a cached result instead of replaying every session log,
+    while still picking up added, removed or edited files."""
+    entries: list[tuple[str, int, int]] = []
+    for jsonl_path, _ in iter_session_files(user_dir):
+        entry = _stat_signature(jsonl_path)
+        if entry:
+            entries.append(entry)
+    for models_path in _iter_models_json_paths(user_dir):
+        entry = _stat_signature(models_path)
+        if entry:
+            entries.append(entry)
+    for workspace_json in (user_dir / "workspaceStorage").glob("*/workspace.json"):
+        entry = _stat_signature(workspace_json)
+        if entry:
+            entries.append(entry)
+    cli_dir = resolve_copilot_cli_dir()
+    for db in (user_dir / "globalStorage" / "state.vscdb", cli_dir / "session-store.db"):
+        # SQLite keeps uncommitted changes in -wal until the next checkpoint. Skip -shm: its
+        # mtime changes on every (even read-only) access, which would defeat the cache.
+        for candidate in (db, db.with_name(db.name + "-wal")):
+            entry = _stat_signature(candidate)
+            if entry:
+                entries.append(entry)
+    state_dir = cli_dir / "session-state"
+    if state_dir.is_dir():
+        for session_dir in state_dir.iterdir():
+            entry = _stat_signature(session_dir)
+            if entry:
+                entries.append(entry)
+            if session_dir.is_dir():
+                for name in ("events.jsonl", "workspace.yaml"):
+                    entry = _stat_signature(session_dir / name)
+                    if entry:
+                        entries.append(entry)
+    return tuple(sorted(entries))
+
+
+_state_cache: dict[Path, tuple[tuple[tuple[str, int, int], ...], dict[str, Any]]] = {}
+_state_cache_lock = threading.Lock()
+
+
+def get_state(user_dir: Path) -> dict[str, Any]:
+    """Dashboard state, re-parsed only when the watched files changed.
+
+    The lock serializes recomputation so concurrent requests share one parse instead of
+    each replaying every session log in parallel (which ballooned memory under auto-refresh)."""
+    with _state_cache_lock:
+        signature = _state_signature(user_dir)
+        cached = _state_cache.get(user_dir)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        state = read_state(user_dir)
+        _state_cache[user_dir] = (signature, state)
+        return state
+
+
 HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GitHub Copilot Session Dashboard</title><style>
@@ -1340,7 +1407,7 @@ document.addEventListener('mouseover',e=>{const c=e.target.closest&&e.target.clo
 document.addEventListener('mouseout',e=>{const c=e.target.closest&&e.target.closest('.title,.workspace');if(c)hideTip()});
 window.addEventListener('scroll',hideTip,true);
 
-async function load(){try{const r=await fetch('/api/data',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());state.data=await r.json();render()}catch(e){$('app').innerHTML=`<div class="error">Unable to load dashboard data.\n\n${esc(e.message)}</div>`}}$('refresh').addEventListener('click',load);$('auto').addEventListener('change',e=>{if(e.target.checked)window.refreshTimer=setInterval(load,60000);else clearInterval(window.refreshTimer)});load();
+let loading=false;async function load(){if(loading)return;loading=true;try{const r=await fetch('/api/data',{cache:'no-store'});if(!r.ok)throw new Error(await r.text());state.data=await r.json();render()}catch(e){$('app').innerHTML=`<div class="error">Unable to load dashboard data.\n\n${esc(e.message)}</div>`}finally{loading=false}}$('refresh').addEventListener('click',load);$('auto').addEventListener('change',e=>{clearInterval(window.refreshTimer);if(e.target.checked)window.refreshTimer=setInterval(load,60000)});load();
 </script></body></html>'''
 
 
@@ -1354,7 +1421,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/data":
             try:
-                payload = json.dumps(read_state(self.user_dir), ensure_ascii=False).encode()
+                state = {**get_state(self.user_dir), "generatedAt": datetime.now(timezone.utc).isoformat()}
+                payload = json.dumps(state, ensure_ascii=False).encode()
             except Exception as exc:  # surface a safe local diagnostic to the UI
                 payload = json.dumps({"error": str(exc)}).encode()
                 self.send_bytes(payload, "application/json", 500)
